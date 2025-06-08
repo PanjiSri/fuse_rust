@@ -1,3 +1,5 @@
+pub mod statediff;
+
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
