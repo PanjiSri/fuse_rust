@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
+use bincode::{Decode, Encode};
 use std::collections::HashMap;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Encode, Decode, Debug)]
 pub enum StateDiffAction {
     Write {
         fid: u64,
@@ -21,7 +21,7 @@ pub enum StateDiffAction {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Encode, Decode, Debug, Default)]
 pub struct StateDiffLog {
     pub fid_map: HashMap<u64, String>,
     pub actions: Vec<StateDiffAction>,
