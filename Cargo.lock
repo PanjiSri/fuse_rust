@@ -129,6 +129,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuselog_apply"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "env_logger",
+ "fuselog_core",
+ "log",
+ "uds",
+]
+
+[[package]]
 name = "fuselog_core"
 version = "0.1.0"
 dependencies = [

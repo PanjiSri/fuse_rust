@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 
 [workspace]
-members = [
+members = [ 
+    "fuselog_apply",
     "fuselog_core",
 ]
