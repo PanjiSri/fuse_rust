@@ -3,6 +3,7 @@ use log::{error, info, warn};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
 
 const SOCKET_PATH: &str = "/tmp/fuselog.sock";
 
@@ -53,6 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Applying action {}/{}: {:?}", i + 1, log.actions.len(), action);
         
         match action {
+            StateDiffAction::Create { fid, uid, gid, mode } => {
+                apply_create(&log, *fid, *uid, *gid, *mode, target_path)?;
+            }
             StateDiffAction::Write { fid, offset, data } => {
                 apply_write(&log, *fid, *offset, data, target_path)?;
             }
@@ -90,6 +94,32 @@ fn get_full_path(log: &StateDiffLog, fid: u64, target_path: &Path) -> Result<Pat
     Ok(target_path.join(file_path))
 }
 
+fn apply_create(
+    log: &StateDiffLog,
+    fid: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_path = get_full_path(log, fid, target_path)?;
+
+    info!("Creating file {:?} with mode {:o} and owner {}:{}", full_path, mode, uid, gid);
+
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::File::create(&full_path)?;
+
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(&full_path, perms)?;
+
+    std::os::unix::fs::chown(&full_path, Some(uid), Some(gid))?;
+    
+    Ok(())
+}
+
 fn apply_write(
     log: &StateDiffLog, 
     fid: u64, 
@@ -103,11 +133,10 @@ fn apply_write(
         std::fs::create_dir_all(parent)?;
     }
     
-    info!("  Writing {} bytes to {:?} at offset {}", data.len(), full_path, offset);
+    info!("Writing {} bytes to {:?} at offset {}", data.len(), full_path, offset);
     
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
         .open(&full_path)?;
     
     use std::io::Seek;
@@ -123,12 +152,12 @@ fn apply_unlink(
     target_path: &Path
 ) -> Result<(), Box<dyn std::error::Error>> {
     let full_path = get_full_path(log, fid, target_path)?;
-    info!("  Removing file: {:?}", full_path);
+    info!("Removing file: {:?}", full_path);
     
     match std::fs::remove_file(&full_path) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!("  File to unlink already doesn't exist: {:?}", full_path);
+            warn!("File to unlink already doesn't exist: {:?}", full_path);
             Ok(())
         }
         Err(e) => Err(Box::new(e))
@@ -147,7 +176,7 @@ fn apply_truncate(
         std::fs::create_dir_all(parent)?;
     }
     
-    info!("  Truncating {:?} to {} bytes", full_path, size);
+    info!("Truncating {:?} to {} bytes", full_path, size);
     
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -168,7 +197,7 @@ fn apply_rename(
     let full_from_path = get_full_path(log, from_fid, target_path)?;
     let full_to_path = get_full_path(log, to_fid, target_path)?;
     
-    info!("  Renaming {:?} to {:?}", full_from_path, full_to_path);
+    info!("Renaming {:?} to {:?}", full_from_path, full_to_path);
     
     if let Some(parent) = full_to_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -187,7 +216,7 @@ fn apply_link(
     let full_source_path = get_full_path(log, source_fid, target_path)?;
     let full_new_link_path = get_full_path(log, new_link_fid, target_path)?;
 
-    info!("  Creating hard link from {:?} to {:?}", full_source_path, full_new_link_path);
+    info!("Creating hard link from {:?} to {:?}", full_source_path, full_new_link_path);
 
     if let Some(parent) = full_new_link_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -206,12 +235,12 @@ fn apply_chown(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let full_path = get_full_path(log, fid, target_path)?;
 
-    info!("  Changing ownership of {:?} to {}:{}", full_path, uid, gid);
+    info!("Changing ownership of {:?} to {}:{}", full_path, uid, gid);
 
     match std::os::unix::fs::chown(&full_path, Some(uid), Some(gid)) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!("  Cannot chown, file/dir does not exist: {:?}. This can be normal if it was deleted.", full_path);
+            warn!("Cannot chown, file/dir does not exist: {:?}. This can be normal if it was deleted.", full_path);
             Ok(())
         }
         Err(e) => Err(Box::new(e)),
@@ -224,7 +253,7 @@ fn apply_mkdir(
     target_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let full_path = get_full_path(log, fid, target_path)?;
-    info!("  Creating directory: {:?}", full_path);
+    info!("Creating directory: {:?}", full_path);
     std::fs::create_dir_all(&full_path)?;
     Ok(())
 }
@@ -235,11 +264,11 @@ fn apply_rmdir(
     target_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let full_path = get_full_path(log, fid, target_path)?;
-    info!("  Removing directory: {:?}", full_path);
+    info!("Removing directory: {:?}", full_path);
     match std::fs::remove_dir(&full_path) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!("  Directory to remove already doesn't exist: {:?}", full_path);
+            warn!("Directory to remove already doesn't exist: {:?}", full_path);
             Ok(())
         }
         Err(e) => Err(Box::new(e)),

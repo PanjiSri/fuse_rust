@@ -1,5 +1,7 @@
 #!/bin/bash
 
+#./test.sh > log.log 2>&1
+
 set -e
 
 MOUNT_DIR="/tmp/fuse_mount"
@@ -84,7 +86,7 @@ test "$TRUNCATED_CONTENT" = "This " || { echo "truncation failed"; exit 1; }
 
 # empty directory test
 test ! -e "$TARGET_DIR/empty_dir" || { echo "empty_dir should have been removed"; exit 1; }
-echo "Removal of empty_dir is correct."
+# echo "Removal of empty_dir is correct."
 
 # rename test
 test ! -f "$TARGET_DIR/rename_me.txt" || { echo "rename_me.txt should not exist after move"; exit 1; }

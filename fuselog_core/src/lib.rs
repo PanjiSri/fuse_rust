@@ -354,9 +354,14 @@ impl Filesystem for FuseLogFS {
                 {
                     let mut log = STATEDIFF_LOG.lock().unwrap();
                     let fid = get_fid(&mut log, &relative_path);
-                    log.actions.push(StateDiffAction::Chown { fid, uid: req.uid(), gid: req.gid() });
+                    log.actions.push(StateDiffAction::Create { 
+                        fid, 
+                        uid: req.uid(), 
+                        gid: req.gid(),
+                        mode,
+                    });
                 }
-                info!("Created file: {:?} with owner {}:{} and logged chown", file_path, req.uid(), req.gid());
+                info!("Logged create for file: {:?} with owner {}:{}", file_path, req.uid(), req.gid());
 
                 if let Ok(metadata) = std::fs::metadata(&file_path) {
                     let attrs = metadata_to_file_attr(ino, &metadata);
@@ -511,9 +516,6 @@ impl Filesystem for FuseLogFS {
                 }
             }
         }
-        
-        // Note: Chmod is not implemented in StateDiffAction, but would be added here
-        // if let Some(new_mode) = mode { ... }
 
         if uid.is_some() || gid.is_some() {
             let current_meta = match std::fs::metadata(&path) {

@@ -1,8 +1,18 @@
 use bincode::{Decode, Encode};
 use std::collections::HashMap;
 
+// Make sure it schema based serialization
+// Maybe try cap and proto  
+// Only capture operation that change the state  
+
 #[derive(Encode, Decode, Debug)]
 pub enum StateDiffAction {
+    Create {
+        fid: u64,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    },
     Write {
         fid: u64,
         offset: u64,
