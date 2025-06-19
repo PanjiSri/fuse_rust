@@ -6,7 +6,7 @@ use fuser::{
     ReplyOpen, ReplyWrite, ReplyCreate, ReplyData, Request,
 };
 use libc::{ENOENT, EIO, EEXIST};
-use log::{debug, info};
+use log::{debug, info, error};
 use statediff::{StateDiffAction, StateDiffLog};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -17,8 +17,7 @@ use std::time::{Duration, UNIX_EPOCH, SystemTime};
 
 const TTL: Duration = Duration::from_secs(1);
 
-static STATEDIFF_LOG: once_cell::sync::Lazy<Arc<Mutex<StateDiffLog>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(StateDiffLog::default())));
+static STATEDIFF_LOG: once_cell::sync::Lazy<Arc<Mutex<StateDiffLog>>> = once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(StateDiffLog::default())));
 
 fn get_fid(path: &str) -> u64 {
     let mut log = STATEDIFF_LOG.lock().unwrap();
@@ -225,8 +224,8 @@ impl Filesystem for FuseLogFS {
         reply.ok();
     }
 
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
-        debug!("mkdir(parent={}, name={:?}, mode={:o})", parent, name, mode);
+    fn mkdir(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+        debug!("mkdir(parent={}, name={:?}, mode={:o}, uid={}, gid={})", parent, name, mode, req.uid(), req.gid());
         
         let mut inodes = self.inodes.lock().unwrap();
         
@@ -247,16 +246,23 @@ impl Filesystem for FuseLogFS {
         
         match std::fs::create_dir(&dir_path) {
             Ok(_) => {
-                let ino = inodes.get_or_create_ino(&dir_path);
-                
                 if let Err(e) = std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(mode)) {
                     debug!("Warning: failed to set directory permissions: {}", e);
                 }
+
+                if let Err(e) = std::os::unix::fs::chown(&dir_path, Some(req.uid()), Some(req.gid())) {
+                    error!("Failed to chown new directory {:?}: {}. Cleaning up.", &dir_path, e);
+                    let _ = std::fs::remove_dir(&dir_path);
+                    reply.error(e.raw_os_error().unwrap_or(EIO));
+                    return;
+                }
+                
+                let ino = inodes.get_or_create_ino(&dir_path);
                 
                 match std::fs::metadata(&dir_path) {
                     Ok(metadata) => {
                         let attrs = metadata_to_file_attr(ino, &metadata);
-                        info!("Created directory: {:?}", dir_path);
+                        info!("Created directory: {:?} with owner {}:{}", dir_path, req.uid(), req.gid());
                         reply.entry(&TTL, &attrs, 0);
                     }
                     Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
@@ -295,8 +301,8 @@ impl Filesystem for FuseLogFS {
         reply.opened(0, 0);
     }
 
-    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
-        debug!("create(parent={}, name={:?}, mode={:o})", parent, name, mode);
+    fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
+        debug!("create(parent={}, name={:?}, mode={:o}, uid={}, gid={})", parent, name, mode, req.uid(), req.gid());
         
         let mut inodes = self.inodes.lock().unwrap();
         
@@ -311,10 +317,22 @@ impl Filesystem for FuseLogFS {
         let file_path = parent_path.join(name);
         
         match std::fs::File::create(&file_path) {
-            Ok(_) => {
+            Ok(_) => { // File is created/truncated and immediately closed.
+                if let Err(e) = std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(mode)) {
+                    debug!("Warning: failed to set file permissions for {:?}: {}", &file_path, e);
+                }
+
+                if let Err(e) = std::os::unix::fs::chown(&file_path, Some(req.uid()), Some(req.gid())) {
+                    error!("Failed to chown new file {:?}: {}. Cleaning up.", &file_path, e);
+                    let _ = std::fs::remove_file(&file_path);
+                    reply.error(e.raw_os_error().unwrap_or(EIO));
+                    return;
+                }
+
                 let ino = inodes.get_or_create_ino(&file_path);
                 if let Ok(metadata) = std::fs::metadata(&file_path) {
                     let attrs = metadata_to_file_attr(ino, &metadata);
+                    info!("Created file: {:?} with owner {}:{}", file_path, req.uid(), req.gid());
                     reply.created(&TTL, &attrs, 0, ino, flags as u32);
                 } else {
                     reply.error(EIO);
@@ -463,11 +481,10 @@ impl Filesystem for FuseLogFS {
         }
     }
 
-    fn setattr(&mut self, _req: &Request, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
-        debug!("setattr(ino={}, size={:?})", ino, size);
-        
+    fn setattr(&mut self, _req: &Request<'_>, ino: u64, _mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
+        debug!("setattr(ino={}, uid={:?}, gid={:?}, size={:?})", ino, uid, gid, size);
+    
         let inodes = self.inodes.lock().unwrap();
-        
         let path = match inodes.get_path(ino) {
             Some(p) => p.clone(),
             None => {
@@ -475,17 +492,45 @@ impl Filesystem for FuseLogFS {
                 return;
             }
         };
-        
+    
+        // Handle ownership change if uid or gid is present
+        if uid.is_some() || gid.is_some() {
+            match std::os::unix::fs::chown(&path, uid, gid) {
+                Ok(_) => {
+                    let (final_uid, final_gid) = match std::fs::metadata(&path) {
+                        Ok(meta) => (uid.unwrap_or_else(|| meta.uid()), gid.unwrap_or_else(|| meta.gid())),
+                        Err(e) => {
+                            error!("chown for {:?} succeeded, but failed to read metadata for logging: {}", path, e);
+                            (uid.unwrap_or(0), gid.unwrap_or(0))
+                        }
+                    };
+    
+                    // Only log if we could determine valid final values
+                    if final_uid != 0 || final_gid != 0 {
+                        let relative_path = self.get_relative_path(&path);
+                        let fid = get_fid(&relative_path);
+                        let mut log = STATEDIFF_LOG.lock().unwrap();
+                        log.actions.push(StateDiffAction::Chown { fid, uid: final_uid, gid: final_gid });
+                        info!("Changed ownership of {:?} to {}:{}", path, final_uid, final_gid);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to chown {:?} to uid={:?}, gid={:?}: {}", path, uid, gid, e);
+                    reply.error(e.raw_os_error().unwrap_or(EIO));
+                    return;
+                }
+            }
+        }
+    
+        // Handle file truncation if size is present
         if let Some(new_size) = size {
-            let relative_path = self.get_relative_path(&path);
-            
             match std::fs::OpenOptions::new().write(true).open(&path) {
                 Ok(file) => {
                     if let Err(e) = file.set_len(new_size) {
                         reply.error(e.raw_os_error().unwrap_or(EIO));
                         return;
                     }
-                    
+                    let relative_path = self.get_relative_path(&path);
                     let fid = get_fid(&relative_path);
                     let mut log = STATEDIFF_LOG.lock().unwrap();
                     log.actions.push(StateDiffAction::Truncate { fid, size: new_size });
@@ -496,7 +541,7 @@ impl Filesystem for FuseLogFS {
                 }
             }
         }
-        
+    
         match std::fs::metadata(&path) {
             Ok(metadata) => {
                 let attrs = metadata_to_file_attr(ino, &metadata);
@@ -504,7 +549,7 @@ impl Filesystem for FuseLogFS {
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
         }
-    }
+    }    
 
     fn release(&mut self, _req: &Request, _ino: u64, _fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
         debug!("release called");
@@ -514,5 +559,114 @@ impl Filesystem for FuseLogFS {
     fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         debug!("flush called");
         reply.ok();
+    }
+
+    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+        debug!("rename(parent={}, name={:?}, newparent={}, newname={:?})", parent, name, newparent, newname);
+
+        let mut inodes = self.inodes.lock().unwrap();
+
+        let from_parent_path = match inodes.get_path(parent) {
+            Some(p) => p.clone(),
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        let from_path = from_parent_path.join(name);
+
+        let to_parent_path = match inodes.get_path(newparent) {
+            Some(p) => p.clone(),
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        let to_path = to_parent_path.join(newname);
+
+        let from_ino = inodes.path_to_ino.get(&from_path).copied();
+
+        match std::fs::rename(&from_path, &to_path) {
+            Ok(_) => {
+                if let Some(ino) = from_ino {
+                    inodes.path_to_ino.remove(&from_path);
+                    inodes.path_to_ino.insert(to_path.clone(), ino);
+                    if let Some(path_ref) = inodes.ino_to_path.get_mut(&ino) {
+                        *path_ref = to_path.clone();
+                    }
+                    info!("Updated inode mapping: ino {} from {:?} to {:?}", ino, from_path, to_path);
+                }
+
+                let relative_from_path = self.get_relative_path(&from_path);
+                let relative_to_path = self.get_relative_path(&to_path);
+
+                let from_fid = get_fid(&relative_from_path);
+                let to_fid = get_fid(&relative_to_path);
+
+                let mut log = STATEDIFF_LOG.lock().unwrap();
+                log.actions.push(StateDiffAction::Rename { from_fid, to_fid });
+                info!("Renamed {:?} to {:?}, logging action", from_path, to_path);
+
+                reply.ok();
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
+    fn link(&mut self, _req: &Request<'_>, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+        debug!("link(ino={}, newparent={}, newname={:?})", ino, newparent, newname);
+
+        let mut inodes = self.inodes.lock().unwrap();
+
+        // Get the path of the original file
+        let source_path = match inodes.get_path(ino) {
+            Some(p) => p.clone(),
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        // Get the path of the folder where the new link will be created
+        let dest_parent_path = match inodes.get_path(newparent) {
+            Some(p) => p.clone(),
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        // Construct the full path for the new link
+        let dest_path = dest_parent_path.join(newname);
+
+        match std::fs::hard_link(&source_path, &dest_path) {
+            Ok(_) => {
+                info!("Created hard link from {:?} to {:?}", source_path, dest_path);
+                
+                // I have to ask this part to Kak Fadhil
+                // This new path now points to the ORIGINAL inode.
+                inodes.path_to_ino.insert(dest_path.clone(), ino);
+
+                // Log for fuselog_apply
+                let relative_source_path = self.get_relative_path(&source_path);
+                let relative_dest_path = self.get_relative_path(&dest_path);
+                let source_fid = get_fid(&relative_source_path);
+                let new_link_fid = get_fid(&relative_dest_path);
+                
+                let mut log = STATEDIFF_LOG.lock().unwrap();
+                log.actions.push(StateDiffAction::Link { source_fid, new_link_fid });
+
+
+                // Reply to the OS using the ORIGINAL inode number.
+                match std::fs::metadata(&dest_path) {
+                    Ok(metadata) => {
+                        let attrs = metadata_to_file_attr(ino, &metadata);
+                        reply.entry(&TTL, &attrs, 0);
+                    }
+                    Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+                }
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
     }
 }

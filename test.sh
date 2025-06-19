@@ -6,29 +6,43 @@ MOUNT_DIR="/tmp/fuse_mount"
 TARGET_DIR="/tmp/target"
 
 cleanup() {
-    echo "===Cleaning up==="
-    kill $FUSELOG_PID 2>/dev/null || true
+    echo "=== Cleaning up ==="
+    if [ ! -z "$FUSELOG_PID" ]; then
+        sudo kill "$FUSELOG_PID" 2>/dev/null || true
+    fi
+    sudo pkill -f fuselog_core || true
     fusermount -u "$MOUNT_DIR" 2>/dev/null || true
-    rm -rf "$MOUNT_DIR" "$TARGET_DIR"
-    rm -f "/tmp/fuselog.sock"
+    sudo rm -rf "$MOUNT_DIR" "$TARGET_DIR"
+    sudo rm -f "/tmp/fuselog.sock"
 }
 trap cleanup EXIT
 
-rm -rf "$MOUNT_DIR" "$TARGET_DIR"
+echo "=== Building workspace ==="
+cargo clean
+cargo build --workspace
+
+echo "=== Setting up directories ==="
+cleanup
 mkdir -p "$MOUNT_DIR" "$TARGET_DIR"
-rm -f "/tmp/fuselog.sock"
+sudo chown "$USER:$USER" "$MOUNT_DIR" "$TARGET_DIR"
 
-echo "===Building project==="
-cargo build
-
-echo "Starting fuselog_core"
-RUST_LOG=info cargo run -p fuselog_core -- "$MOUNT_DIR" &
+echo "=== Starting fuselog_core ==="
+sudo RUST_LOG=info ./target/debug/fuselog_core "$MOUNT_DIR" &
 FUSELOG_PID=$!
 
-sleep 3
+echo "=== Waiting for filesystem to mount ==="
+i=0
+while ! mount | grep -q "$MOUNT_DIR"; do
+    if [ $i -ge 10 ]; then
+        echo "Error: Filesystem mount timed out." >&2
+        exit 1
+    fi
+    sleep 1
+    i=$((i+1))
+done
+echo "Filesystem mounted successfully."
 
-echo "===Performing file operations==="
-
+echo "=== Performing file operations ==="
 echo "Hello, Fuselog!" > "$MOUNT_DIR/test1.txt"
 mkdir -p "$MOUNT_DIR/subdir"
 echo "Subdirectory test" > "$MOUNT_DIR/subdir/test2.txt"
@@ -37,12 +51,17 @@ echo "Temporary content" > "$MOUNT_DIR/temp.txt"
 rm "$MOUNT_DIR/temp.txt"
 echo "This will be truncated" > "$MOUNT_DIR/truncate_test.txt"
 truncate -s 5 "$MOUNT_DIR/truncate_test.txt"
+echo "Rename this file" > "$MOUNT_DIR/rename_me.txt"
+mv "$MOUNT_DIR/rename_me.txt" "$MOUNT_DIR/subdir/renamed.txt"
+echo "Original file." > "$MOUNT_DIR/original.txt"
+ln "$MOUNT_DIR/original.txt" "$MOUNT_DIR/nickname.txt"
+echo "chown test" > "$MOUNT_DIR/chown_test.txt"
+sudo chown 1:1 "$MOUNT_DIR/chown_test.txt"
 
-echo "===Running fuselog_apply==="
-RUST_LOG=info cargo run -p fuselog_apply -- "$TARGET_DIR"
+echo "=== Running fuselog_apply ==="
+sudo RUST_LOG=info ./target/debug/fuselog_apply "$TARGET_DIR"
 
-echo "===Verifying results==="
-
+echo "=== Verifying results ==="
 test -f "$TARGET_DIR/test1.txt" || { echo "test1.txt missing"; exit 1; }
 CONTENT_TEST1=$(cat "$TARGET_DIR/test1.txt")
 EXPECTED_TEST1="Hello, Fuselog!
@@ -57,7 +76,26 @@ test "$CONTENT_TEST2" = "$EXPECTED_TEST2" || { echo "subdir/test2.txt content mi
 test ! -f "$TARGET_DIR/temp.txt" || { echo "temp.txt should be deleted"; exit 1; }
 test -f "$TARGET_DIR/truncate_test.txt" || { echo "truncate_test.txt missing"; exit 1; }
 
+# truncation test
 TRUNCATED_CONTENT=$(cat "$TARGET_DIR/truncate_test.txt")
 test "$TRUNCATED_CONTENT" = "This " || { echo "truncation failed"; exit 1; }
 
-echo "All tests passed!"
+# rename test
+test ! -f "$TARGET_DIR/rename_me.txt" || { echo "rename_me.txt should not exist after move"; exit 1; }
+test -f "$TARGET_DIR/subdir/renamed.txt" || { echo "subdir/renamed.txt missing after move"; exit 1; }
+RENAMED_CONTENT=$(cat "$TARGET_DIR/subdir/renamed.txt")
+test "$RENAMED_CONTENT" = "Rename this file" || { echo "renamed.txt content mismatch"; exit 1; }
+
+# hard link test
+test -f "$TARGET_DIR/original.txt" || { echo "original.txt missing"; exit 1; }
+test -f "$TARGET_DIR/nickname.txt" || { echo "nickname.txt missing"; exit 1; }
+CONTENT_NICKNAME=$(cat "$TARGET_DIR/nickname.txt")
+test "$CONTENT_NICKNAME" = "Original file." || { echo "nickname.txt content mismatch"; exit 1; }
+
+# chown test
+test -f "$TARGET_DIR/chown_test.txt" || { echo "chown_test.txt missing"; exit 1; }
+OWNER_INFO=$(stat -c "%u:%g" "$TARGET_DIR/chown_test.txt")
+test "$OWNER_INFO" = "1:1" || { echo "chown failed, owner is $OWNER_INFO, expected 1:1"; exit 1; }
+
+echo ""
+echo "All tests passed, Yeay!"

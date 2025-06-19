@@ -19,6 +19,15 @@ pub enum StateDiffAction {
         fid: u64,
         size: u64,
     },
+    Link {
+        source_fid: u64,
+        new_link_fid: u64,
+    },
+    Chown {
+        fid: u64,
+        uid: u32,
+        gid: u32,
+    },
 }
 
 #[derive(Encode, Decode, Debug, Default)]

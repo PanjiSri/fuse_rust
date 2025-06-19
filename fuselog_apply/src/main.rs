@@ -65,6 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             StateDiffAction::Rename { from_fid, to_fid } => {
                 apply_rename(&log, *from_fid, *to_fid, target_path)?;
             }
+            StateDiffAction::Link { source_fid, new_link_fid } => {
+                apply_link(&log, *source_fid, *new_link_fid, target_path)?;
+            }
+            StateDiffAction::Chown { fid, uid, gid } => {
+                apply_chown(&log, *fid, *uid, *gid, target_path)?;
+            }
         }
     }
 
@@ -174,3 +180,52 @@ fn apply_rename(
     Ok(())
 }
 
+fn apply_link(
+    log: &StateDiffLog,
+    source_fid: u64,
+    new_link_fid: u64,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_file_path = log.fid_map.get(&source_fid)
+        .ok_or_else(|| format!("Unknown source file ID for link: {}", source_fid))?;
+    let new_link_path = log.fid_map.get(&new_link_fid)
+        .ok_or_else(|| format!("Unknown new link file ID for link: {}", new_link_fid))?;
+
+    let full_source_path = target_path.join(source_file_path);
+    let full_new_link_path = target_path.join(new_link_path);
+
+    info!("  Creating hard link from {:?} to {:?}", full_source_path, full_new_link_path);
+
+    if let Some(parent) = full_new_link_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    
+    std::fs::hard_link(full_source_path, full_new_link_path)?;
+    Ok(())
+}
+
+fn apply_chown(
+    log: &StateDiffLog,
+    fid: u64,
+    uid: u32,
+    gid: u32,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_path = log.fid_map.get(&fid)
+        .ok_or_else(|| format!("Unknown file ID for chown: {}", fid))?;
+
+    let full_path = target_path.join(file_path);
+
+    info!("  Changing ownership of {:?} to {}:{}", full_path, uid, gid);
+
+    match std::os::unix::fs::chown(&full_path, Some(uid), Some(gid)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("  Cannot chown, file does not exist: {:?}", full_path);
+            // Well, I think it is not fatal error if the file was pruned
+            // But I will revisit this later
+            Ok(())
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
