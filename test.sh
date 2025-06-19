@@ -45,6 +45,8 @@ echo "Filesystem mounted successfully."
 echo "=== Performing file operations ==="
 echo "Hello, Fuselog!" > "$MOUNT_DIR/test1.txt"
 mkdir -p "$MOUNT_DIR/subdir"
+mkdir "$MOUNT_DIR/empty_dir" 
+rmdir "$MOUNT_DIR/empty_dir" 
 echo "Subdirectory test" > "$MOUNT_DIR/subdir/test2.txt"
 echo "Modified test1.txt" >> "$MOUNT_DIR/test1.txt"
 echo "Temporary content" > "$MOUNT_DIR/temp.txt"
@@ -79,6 +81,10 @@ test -f "$TARGET_DIR/truncate_test.txt" || { echo "truncate_test.txt missing"; e
 # truncation test
 TRUNCATED_CONTENT=$(cat "$TARGET_DIR/truncate_test.txt")
 test "$TRUNCATED_CONTENT" = "This " || { echo "truncation failed"; exit 1; }
+
+# empty directory test
+test ! -e "$TARGET_DIR/empty_dir" || { echo "empty_dir should have been removed"; exit 1; }
+echo "Removal of empty_dir is correct."
 
 # rename test
 test ! -f "$TARGET_DIR/rename_me.txt" || { echo "rename_me.txt should not exist after move"; exit 1; }

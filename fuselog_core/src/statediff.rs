@@ -28,6 +28,12 @@ pub enum StateDiffAction {
         uid: u32,
         gid: u32,
     },
+    Mkdir {
+        fid: u64,
+    },
+    Rmdir {
+        fid: u64,
+    },
 }
 
 #[derive(Encode, Decode, Debug, Default)]

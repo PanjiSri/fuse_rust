@@ -2,7 +2,7 @@ use fuselog_core::statediff::{StateDiffAction, StateDiffLog};
 use log::{error, info, warn};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SOCKET_PATH: &str = "/tmp/fuselog.sock";
 
@@ -71,11 +71,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             StateDiffAction::Chown { fid, uid, gid } => {
                 apply_chown(&log, *fid, *uid, *gid, target_path)?;
             }
+            StateDiffAction::Mkdir { fid } => {
+                apply_mkdir(&log, *fid, target_path)?;
+            }
+            StateDiffAction::Rmdir { fid } => {
+                apply_rmdir(&log, *fid, target_path)?;
+            }
         }
     }
 
     info!("Successfully applied all {} actions", log.actions.len());
     Ok(())
+}
+
+fn get_full_path(log: &StateDiffLog, fid: u64, target_path: &Path) -> Result<PathBuf, String> {
+    let file_path = log.fid_map.get(&fid)
+        .ok_or_else(|| format!("Unknown file ID: {}", fid))?;
+    Ok(target_path.join(file_path))
 }
 
 fn apply_write(
@@ -85,10 +97,7 @@ fn apply_write(
     data: &[u8], 
     target_path: &Path
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = log.fid_map.get(&fid)
-        .ok_or_else(|| format!("Unknown file ID: {}", fid))?;
-    
-    let full_path = target_path.join(file_path);
+    let full_path = get_full_path(log, fid, target_path)?;
     
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -113,16 +122,13 @@ fn apply_unlink(
     fid: u64, 
     target_path: &Path
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = log.fid_map.get(&fid)
-        .ok_or_else(|| format!("Unknown file ID: {}", fid))?;
-    
-    let full_path = target_path.join(file_path);
+    let full_path = get_full_path(log, fid, target_path)?;
     info!("  Removing file: {:?}", full_path);
     
     match std::fs::remove_file(&full_path) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!("  File already doesn't exist: {:?}", full_path);
+            warn!("  File to unlink already doesn't exist: {:?}", full_path);
             Ok(())
         }
         Err(e) => Err(Box::new(e))
@@ -135,10 +141,7 @@ fn apply_truncate(
     size: u64, 
     target_path: &Path
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = log.fid_map.get(&fid)
-        .ok_or_else(|| format!("Unknown file ID: {}", fid))?;
-    
-    let full_path = target_path.join(file_path);
+    let full_path = get_full_path(log, fid, target_path)?;
     
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -148,7 +151,7 @@ fn apply_truncate(
     
     let file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)  
+        .create(true)
         .open(&full_path)?;
     
     file.set_len(size)?;
@@ -162,13 +165,8 @@ fn apply_rename(
     to_fid: u64, 
     target_path: &Path
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let from_path = log.fid_map.get(&from_fid)
-        .ok_or_else(|| format!("Unknown from file ID: {}", from_fid))?;
-    let to_path = log.fid_map.get(&to_fid)
-        .ok_or_else(|| format!("Unknown to file ID: {}", to_fid))?;
-    
-    let full_from_path = target_path.join(from_path);
-    let full_to_path = target_path.join(to_path);
+    let full_from_path = get_full_path(log, from_fid, target_path)?;
+    let full_to_path = get_full_path(log, to_fid, target_path)?;
     
     info!("  Renaming {:?} to {:?}", full_from_path, full_to_path);
     
@@ -186,13 +184,8 @@ fn apply_link(
     new_link_fid: u64,
     target_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source_file_path = log.fid_map.get(&source_fid)
-        .ok_or_else(|| format!("Unknown source file ID for link: {}", source_fid))?;
-    let new_link_path = log.fid_map.get(&new_link_fid)
-        .ok_or_else(|| format!("Unknown new link file ID for link: {}", new_link_fid))?;
-
-    let full_source_path = target_path.join(source_file_path);
-    let full_new_link_path = target_path.join(new_link_path);
+    let full_source_path = get_full_path(log, source_fid, target_path)?;
+    let full_new_link_path = get_full_path(log, new_link_fid, target_path)?;
 
     info!("  Creating hard link from {:?} to {:?}", full_source_path, full_new_link_path);
 
@@ -211,19 +204,42 @@ fn apply_chown(
     gid: u32,
     target_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = log.fid_map.get(&fid)
-        .ok_or_else(|| format!("Unknown file ID for chown: {}", fid))?;
-
-    let full_path = target_path.join(file_path);
+    let full_path = get_full_path(log, fid, target_path)?;
 
     info!("  Changing ownership of {:?} to {}:{}", full_path, uid, gid);
 
     match std::os::unix::fs::chown(&full_path, Some(uid), Some(gid)) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!("  Cannot chown, file does not exist: {:?}", full_path);
-            // Well, I think it is not fatal error if the file was pruned
-            // But I will revisit this later
+            warn!("  Cannot chown, file/dir does not exist: {:?}. This can be normal if it was deleted.", full_path);
+            Ok(())
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+fn apply_mkdir(
+    log: &StateDiffLog,
+    fid: u64,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_path = get_full_path(log, fid, target_path)?;
+    info!("  Creating directory: {:?}", full_path);
+    std::fs::create_dir_all(&full_path)?;
+    Ok(())
+}
+
+fn apply_rmdir(
+    log: &StateDiffLog,
+    fid: u64,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_path = get_full_path(log, fid, target_path)?;
+    info!("  Removing directory: {:?}", full_path);
+    match std::fs::remove_dir(&full_path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("  Directory to remove already doesn't exist: {:?}", full_path);
             Ok(())
         }
         Err(e) => Err(Box::new(e)),
