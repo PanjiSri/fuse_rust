@@ -59,6 +59,7 @@ echo "Rename this file" > "$MOUNT_DIR/rename_me.txt"
 mv "$MOUNT_DIR/rename_me.txt" "$MOUNT_DIR/subdir/renamed.txt"
 echo "Original file." > "$MOUNT_DIR/original.txt"
 ln "$MOUNT_DIR/original.txt" "$MOUNT_DIR/nickname.txt"
+ln -s original.txt "$MOUNT_DIR/symlink.txt"
 echo "chown test" > "$MOUNT_DIR/chown_test.txt"
 sudo chown 1:1 "$MOUNT_DIR/chown_test.txt"
 
@@ -66,44 +67,63 @@ echo "=== Running fuselog_apply ==="
 sudo RUST_LOG=info ./target/debug/fuselog_apply "$TARGET_DIR"
 
 echo "=== Verifying results ==="
-test -f "$TARGET_DIR/test1.txt" || { echo "test1.txt missing"; exit 1; }
+
+echo -n "Verifying test1.txt content... "
+test -f "$TARGET_DIR/test1.txt" || { echo "FAIL: test1.txt missing"; exit 1; }
 CONTENT_TEST1=$(cat "$TARGET_DIR/test1.txt")
 EXPECTED_TEST1="Hello, Fuselog!
 Modified test1.txt"
-test "$CONTENT_TEST1" = "$EXPECTED_TEST1" || { echo "test1.txt content mismatch. Got: '$CONTENT_TEST1', Expected: '$EXPECTED_TEST1'"; exit 1; }
+test "$CONTENT_TEST1" = "$EXPECTED_TEST1" || { echo "FAIL: test1.txt content mismatch. Got: '$CONTENT_TEST1', Expected: '$EXPECTED_TEST1'"; exit 1; }
+echo "OK"
 
-test -f "$TARGET_DIR/subdir/test2.txt" || { echo "subdir/test2.txt missing"; exit 1; }
+echo -n "Verifying subdir/test2.txt content... "
+test -f "$TARGET_DIR/subdir/test2.txt" || { echo "FAIL: subdir/test2.txt missing"; exit 1; }
 CONTENT_TEST2=$(cat "$TARGET_DIR/subdir/test2.txt")
 EXPECTED_TEST2="Subdirectory test"
-test "$CONTENT_TEST2" = "$EXPECTED_TEST2" || { echo "subdir/test2.txt content mismatch. Got: '$CONTENT_TEST2', Expected: '$EXPECTED_TEST2'"; exit 1; }
+test "$CONTENT_TEST2" = "$EXPECTED_TEST2" || { echo "FAIL: subdir/test2.txt content mismatch. Got: '$CONTENT_TEST2', Expected: '$EXPECTED_TEST2'"; exit 1; }
+echo "OK"
 
-test ! -f "$TARGET_DIR/temp.txt" || { echo "temp.txt should be deleted"; exit 1; }
-test -f "$TARGET_DIR/truncate_test.txt" || { echo "truncate_test.txt missing"; exit 1; }
+echo -n "Verifying temp.txt deletion... "
+test ! -f "$TARGET_DIR/temp.txt" || { echo "FAIL: temp.txt should be deleted"; exit 1; }
+echo "OK"
 
-# truncation test
+echo -n "Verifying file truncation... "
+test -f "$TARGET_DIR/truncate_test.txt" || { echo "FAIL: truncate_test.txt missing"; exit 1; }
 TRUNCATED_CONTENT=$(cat "$TARGET_DIR/truncate_test.txt")
-test "$TRUNCATED_CONTENT" = "This " || { echo "truncation failed"; exit 1; }
+test "$TRUNCATED_CONTENT" = "This " || { echo "FAIL: truncation failed"; exit 1; }
+echo "OK"
 
-# empty directory test
-test ! -e "$TARGET_DIR/empty_dir" || { echo "empty_dir should have been removed"; exit 1; }
-# echo "Removal of empty_dir is correct."
+echo -n "Verifying empty_dir removal... "
+test ! -e "$TARGET_DIR/empty_dir" || { echo "FAIL: empty_dir should have been removed"; exit 1; }
+echo "OK"
 
-# rename test
-test ! -f "$TARGET_DIR/rename_me.txt" || { echo "rename_me.txt should not exist after move"; exit 1; }
-test -f "$TARGET_DIR/subdir/renamed.txt" || { echo "subdir/renamed.txt missing after move"; exit 1; }
+echo -n "Verifying file rename... "
+test ! -f "$TARGET_DIR/rename_me.txt" || { echo "FAIL: rename_me.txt should not exist after move"; exit 1; }
+test -f "$TARGET_DIR/subdir/renamed.txt" || { echo "FAIL: subdir/renamed.txt missing after move"; exit 1; }
 RENAMED_CONTENT=$(cat "$TARGET_DIR/subdir/renamed.txt")
-test "$RENAMED_CONTENT" = "Rename this file" || { echo "renamed.txt content mismatch"; exit 1; }
+test "$RENAMED_CONTENT" = "Rename this file" || { echo "FAIL: renamed.txt content mismatch"; exit 1; }
+echo "OK"
 
-# hard link test
-test -f "$TARGET_DIR/original.txt" || { echo "original.txt missing"; exit 1; }
-test -f "$TARGET_DIR/nickname.txt" || { echo "nickname.txt missing"; exit 1; }
+echo -n "Verifying hard link... "
+test -f "$TARGET_DIR/original.txt" || { echo "FAIL: original.txt missing"; exit 1; }
+test -f "$TARGET_DIR/nickname.txt" || { echo "FAIL: nickname.txt missing"; exit 1; }
 CONTENT_NICKNAME=$(cat "$TARGET_DIR/nickname.txt")
-test "$CONTENT_NICKNAME" = "Original file." || { echo "nickname.txt content mismatch"; exit 1; }
+test "$CONTENT_NICKNAME" = "Original file." || { echo "FAIL: nickname.txt content mismatch"; exit 1; }
+echo "OK"
 
-# chown test
-test -f "$TARGET_DIR/chown_test.txt" || { echo "chown_test.txt missing"; exit 1; }
+echo -n "Verifying symbolic link... "
+test -L "$TARGET_DIR/symlink.txt" || { echo "FAIL: symlink.txt is not a symlink or is missing"; exit 1; }
+SYMLINK_TARGET=$(readlink "$TARGET_DIR/symlink.txt")
+test "$SYMLINK_TARGET" = "original.txt" || { echo "FAIL: symlink.txt has wrong target. Got: '$SYMLINK_TARGET', Expected: 'original.txt'"; exit 1; }
+SYMLINK_OWNER_INFO=$(stat -c "%u:%g" "$TARGET_DIR/symlink.txt")
+test "$SYMLINK_OWNER_INFO" = "$(id -u):$(id -g)" || { echo "FAIL: symlink owner is $SYMLINK_OWNER_INFO, expected $(id -u):$(id -g)"; exit 1; }
+echo "OK"
+
+echo -n "Verifying file ownership (chown)... "
+test -f "$TARGET_DIR/chown_test.txt" || { echo "FAIL: chown_test.txt missing"; exit 1; }
 OWNER_INFO=$(stat -c "%u:%g" "$TARGET_DIR/chown_test.txt")
-test "$OWNER_INFO" = "1:1" || { echo "chown failed, owner is $OWNER_INFO, expected 1:1"; exit 1; }
+test "$OWNER_INFO" = "1:1" || { echo "FAIL: chown failed, owner is $OWNER_INFO, expected 1:1"; exit 1; }
+echo "OK"
 
 echo ""
 echo "All tests passed, Yeay!"

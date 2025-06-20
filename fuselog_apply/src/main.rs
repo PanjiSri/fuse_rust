@@ -81,6 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             StateDiffAction::Rmdir { fid } => {
                 apply_rmdir(&log, *fid, target_path)?;
             }
+            StateDiffAction::Symlink { link_fid, target_path: symlink_target_str, uid, gid } => {
+                apply_symlink(&log, *link_fid, symlink_target_str, *uid, *gid, target_path)?;
+            }
         }
     }
 
@@ -137,6 +140,7 @@ fn apply_write(
     
     let mut file = std::fs::OpenOptions::new()
         .write(true)
+        .create(true)
         .open(&full_path)?;
     
     use std::io::Seek;
@@ -237,7 +241,7 @@ fn apply_chown(
 
     info!("Changing ownership of {:?} to {}:{}", full_path, uid, gid);
 
-    match std::os::unix::fs::chown(&full_path, Some(uid), Some(gid)) {
+    match std::os::unix::fs::lchown(&full_path, Some(uid), Some(gid)) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             warn!("Cannot chown, file/dir does not exist: {:?}. This can be normal if it was deleted.", full_path);
@@ -273,4 +277,26 @@ fn apply_rmdir(
         }
         Err(e) => Err(Box::new(e)),
     }
+}
+
+fn apply_symlink(
+    log: &StateDiffLog,
+    link_fid: u64,
+    target_path_str: &str,
+    uid: u32,
+    gid: u32,
+    base_target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_link_path = get_full_path(log, link_fid, base_target_path)?;
+
+    info!("Creating symlink {:?} -> {} with owner {}:{}", full_link_path, target_path_str, uid, gid);
+
+    if let Some(parent) = full_link_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::os::unix::fs::symlink(target_path_str, &full_link_path)?;
+    std::os::unix::fs::lchown(&full_link_path, Some(uid), Some(gid))?;
+    
+    Ok(())
 }

@@ -44,6 +44,12 @@ pub enum StateDiffAction {
     Rmdir {
         fid: u64,
     },
+    Symlink {
+        link_fid: u64,
+        target_path: String,
+        uid: u32,
+        gid: u32,
+    },
 }
 
 #[derive(Encode, Decode, Debug, Default)]

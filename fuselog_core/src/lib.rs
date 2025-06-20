@@ -2,8 +2,8 @@ pub mod socket;
 pub mod statediff;
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, ReplyCreate, ReplyData, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, ReplyCreate, Request, TimeOrNow,
 };
 use libc::{ENOENT, EIO, EEXIST};
 use log::{debug, info, error, warn};
@@ -138,7 +138,8 @@ impl Filesystem for FuseLogFS {
         
         let child_path = parent_path.join(name);
         
-        match std::fs::metadata(&child_path) {
+        // Use symlink_metadata to avoid following symlinks
+        match std::fs::symlink_metadata(&child_path) {
             Ok(metadata) => {
                 let ino = inodes.get_or_create_ino(&child_path);
                 let attrs = metadata_to_file_attr(ino, &metadata);
@@ -161,10 +162,30 @@ impl Filesystem for FuseLogFS {
             }
         };
         
-        match std::fs::metadata(&path) {
+        // Use symlink_metadata to avoid following symlinks
+        match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 let attrs = metadata_to_file_attr(ino, &metadata);
                 reply.attr(&TTL, &attrs);
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        debug!("readlink(ino={})", ino);
+        let inodes = self.inodes.lock().unwrap();
+        let path = match inodes.get_path(ino) {
+            Some(p) => p.clone(),
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        match std::fs::read_link(&path) {
+            Ok(target_path) => {
+                reply.data(target_path.as_os_str().as_encoded_bytes());
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
         }
@@ -208,6 +229,8 @@ impl Filesystem for FuseLogFS {
                 
                 let file_type = if entry.file_type().map_or(false, |ft| ft.is_dir()) {
                     FileType::Directory
+                } else if entry.file_type().map_or(false, |ft| ft.is_symlink()) {
+                    FileType::Symlink
                 } else {
                     FileType::RegularFile
                 };
@@ -310,6 +333,57 @@ impl Filesystem for FuseLogFS {
                 }
                 info!("Removed and logged directory: {:?}", dir_path);
                 reply.ok();
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
+    fn symlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+        debug!("symlink(parent={}, name={:?}, target={:?})", parent, name, link);
+
+        let mut inodes = self.inodes.lock().unwrap();
+
+        let parent_path = match inodes.get_path(parent) {
+            Some(p) => p.clone(),
+            None => { reply.error(ENOENT); return; }
+        };
+
+        let link_path = parent_path.join(name);
+        let relative_link_path = self.get_relative_path(&link_path);
+        let target_path_str = link.to_string_lossy().to_string();
+
+        match std::os::unix::fs::symlink(link, &link_path) {
+            Ok(_) => {
+                // Use lchown to set ownership of the link itself, not the target
+                if let Err(e) = std::os::unix::fs::chown(&link_path, Some(req.uid()), Some(req.gid())) {
+                    error!("Failed to chown new symlink {:?}: {}. Cleaning up.", &link_path, e);
+                    let _ = std::fs::remove_file(&link_path);
+                    reply.error(e.raw_os_error().unwrap_or(EIO));
+                    return;
+                }
+
+                let ino = inodes.get_or_create_ino(&link_path);
+                
+                {
+                    let mut log = STATEDIFF_LOG.lock().unwrap();
+                    let link_fid = get_fid(&mut log, &relative_link_path);
+                    log.actions.push(StateDiffAction::Symlink {
+                        link_fid,
+                        target_path: target_path_str,
+                        uid: req.uid(),
+                        gid: req.gid(),
+                    });
+                }
+                info!("Created and logged symlink: {:?} -> {:?}", link_path, link);
+
+                // Use symlink_metadata to get attributes of the link itself
+                match std::fs::symlink_metadata(&link_path) {
+                    Ok(metadata) => {
+                        let attrs = metadata_to_file_attr(ino, &metadata);
+                        reply.entry(&TTL, &attrs, 0);
+                    }
+                    Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+                }
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
         }
@@ -518,7 +592,7 @@ impl Filesystem for FuseLogFS {
         }
 
         if uid.is_some() || gid.is_some() {
-            let current_meta = match std::fs::metadata(&path) {
+            let current_meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(e) => {
                      reply.error(e.raw_os_error().unwrap_or(EIO));
@@ -528,7 +602,14 @@ impl Filesystem for FuseLogFS {
             let final_uid = uid.unwrap_or_else(|| current_meta.uid());
             let final_gid = gid.unwrap_or_else(|| current_meta.gid());
             
-            match std::os::unix::fs::chown(&path, Some(final_uid), Some(final_gid)) {
+            // Use lchown for symlinks, chown for other file types
+            let chown_result = if current_meta.file_type().is_symlink() {
+                std::os::unix::fs::chown(&path, Some(final_uid), Some(final_gid))
+            } else {
+                std::os::unix::fs::chown(&path, Some(final_uid), Some(final_gid))
+            };
+
+            match chown_result {
                 Ok(_) => {
                     let mut log = STATEDIFF_LOG.lock().unwrap();
                     let fid = get_fid(&mut log, &relative_path);
@@ -543,7 +624,7 @@ impl Filesystem for FuseLogFS {
             }
         }
     
-        match std::fs::metadata(&path) {
+        match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 let attrs = metadata_to_file_attr(ino, &metadata);
                 reply.attr(&TTL, &attrs);
