@@ -75,6 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             StateDiffAction::Chown { fid, uid, gid } => {
                 apply_chown(&log, *fid, *uid, *gid, target_path)?;
             }
+            StateDiffAction::Chmod { fid, mode } => {
+                apply_chmod(&log, *fid, *mode, target_path)?;
+            }
             StateDiffAction::Mkdir { fid } => {
                 apply_mkdir(&log, *fid, target_path)?;
             }
@@ -245,6 +248,27 @@ fn apply_chown(
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             warn!("Cannot chown, file/dir does not exist: {:?}. This can be normal if it was deleted.", full_path);
+            Ok(())
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+fn apply_chmod(
+    log: &StateDiffLog,
+    fid: u64,
+    mode: u32,
+    target_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_path = get_full_path(log, fid, target_path)?;
+
+    info!("Changing mode of {:?} to {:o}", full_path, mode);
+
+    let perms = std::fs::Permissions::from_mode(mode);
+    match std::fs::set_permissions(&full_path, perms) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("Cannot chmod, file/dir does not exist: {:?}. This can be normal if it was deleted.", full_path);
             Ok(())
         }
         Err(e) => Err(Box::new(e)),

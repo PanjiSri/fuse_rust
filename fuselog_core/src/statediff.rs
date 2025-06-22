@@ -38,6 +38,10 @@ pub enum StateDiffAction {
         uid: u32,
         gid: u32,
     },
+    Chmod {
+        fid: u64,
+        mode: u32,
+    },
     Mkdir {
         fid: u64,
     },

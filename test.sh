@@ -62,6 +62,13 @@ ln "$MOUNT_DIR/original.txt" "$MOUNT_DIR/nickname.txt"
 ln -s original.txt "$MOUNT_DIR/symlink.txt"
 echo "chown test" > "$MOUNT_DIR/chown_test.txt"
 sudo chown 1:1 "$MOUNT_DIR/chown_test.txt"
+chmod 777 "$MOUNT_DIR/test1.txt"
+
+# echo "=== Testing write coalescing ==="
+# echo "----------" > "$MOUNT_DIR/coalesce_test.txt"
+# printf -- '--BCDE----' | dd of="$MOUNT_DIR/coalesce_test.txt" bs=1 count=10 conv=notrunc
+# printf -- '--BXDY----' | dd of="$MOUNT_DIR/coalesce_test.txt" bs=1 count=10 conv=notrunc
+# printf -- '--BXDY----' | dd of="$MOUNT_DIR/coalesce_test.txt" bs=1 count=10 conv=notrunc
 
 echo "=== Running fuselog_apply ==="
 sudo RUST_LOG=info ./target/debug/fuselog_apply "$TARGET_DIR"
@@ -124,6 +131,19 @@ test -f "$TARGET_DIR/chown_test.txt" || { echo "FAIL: chown_test.txt missing"; e
 OWNER_INFO=$(stat -c "%u:%g" "$TARGET_DIR/chown_test.txt")
 test "$OWNER_INFO" = "1:1" || { echo "FAIL: chown failed, owner is $OWNER_INFO, expected 1:1"; exit 1; }
 echo "OK"
+
+echo -n "Verifying file mode (chmod)... "
+test -f "$TARGET_DIR/test1.txt" || { echo "FAIL: test1.txt missing for chmod test"; exit 1; }
+PERMS=$(stat -c "%a" "$TARGET_DIR/test1.txt")
+test "${PERMS: -3}" = "777" || { echo "FAIL: chmod failed, mode is $PERMS, expected 777"; exit 1; }
+echo "OK"
+
+# echo -n "Verifying write coalescing... "
+# test -f "$TARGET_DIR/coalesce_test.txt" || { echo "FAIL: coalesce_test.txt missing"; exit 1; }
+# COALESCE_CONTENT=$(cat "$TARGET_DIR/coalesce_test.txt" | tr -d '\n')
+# EXPECTED_COALESCE="--BXDY----"
+# test "$COALESCE_CONTENT" = "$EXPECTED_COALESCE" || { echo "FAIL: coalesce_test.txt content mismatch. Got: '$COALESCE_CONTENT', Expected: '$EXPECTED_COALESCE'"; exit 1; }
+# echo "OK"
 
 echo ""
 echo "All tests passed, Yeay!"
