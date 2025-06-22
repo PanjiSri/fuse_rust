@@ -807,4 +807,53 @@ impl Filesystem for FuseLogFS {
             Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
         }
     }
+
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
+        // I think I don't need to log it in the StateDiffLog
+        // because fsync doesn't change file content or metadata;
+        debug!("fsync(ino={}, datasync={})", ino, datasync);
+
+        let inodes = self.inodes.lock().unwrap();
+        let path = match inodes.get_path(ino) {
+            Some(p) => p.clone(),
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!("fsync called on non-existent file (ino {}): {:?}", ino, path);
+                reply.error(ENOENT);
+                return;
+            }
+            Err(e) => {
+                error!("Failed to open file for fsync {:?}: {}", path, e);
+                reply.error(e.raw_os_error().unwrap_or(EIO));
+                return;
+            }
+        };
+
+        let sync_result = if datasync {
+            // Corresponds to fdatasync(): syncs file data, but not necessarily metadata.
+            file.sync_data()
+        } else {
+            // Corresponds to fsync(): syncs both file data and metadata.
+            file.sync_all()
+        };
+
+        match sync_result {
+            Ok(_) => {
+                info!("Successfully synced file: {:?}", path);
+                reply.ok();
+            }
+            Err(e) => {
+                error!("Failed to sync file {:?}: {}", path, e);
+                reply.error(e.raw_os_error().unwrap_or(EIO));
+            }
+        }
+    }
+
 }
