@@ -29,7 +29,7 @@ fn handle_client(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error
             let action_count = log.actions.len();
             let fid_count = log.fid_map.len();
             log.actions.clear();
-            log.fid_map.clear();
+            // log.fid_map.clear();
             
             info!("Socket: Cleared statediff log (had {} actions, {} fids). Sending {} bytes", 
                   action_count, fid_count, data.len());
