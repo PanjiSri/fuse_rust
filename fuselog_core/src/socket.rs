@@ -2,7 +2,6 @@ use crate::STATEDIFF_LOG;
 use bincode::config;
 use log::{error, info, warn};
 use std::io::{Read, Write};
-//use std::thread;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 fn handle_client(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error>> {
@@ -18,12 +17,10 @@ fn handle_client(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error
                     b'c' => clear_statediff(),
                     b'm' => {
                         println!("[]==========[] CHECKPOINT []==========[] ");
-                        stream.write_all(b"Checkpoint marked")?;
                         Ok(())
                     },
                     _ => {
                         warn!("Socket: Received unknown command: {}", buffer[0] as char);
-                        stream.write_all(b"Unknown command")?;
                         Ok(())
                     }
                 };
@@ -98,6 +95,10 @@ fn send_statediff(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Erro
         data
     };
 
+    // Send stateDiff size first
+    stream.write_all(&serialized_data.len().to_le_bytes())?;
+
+    // Send the actual stateDiff
     stream.write_all(&serialized_data)?;
     info!("Socket: Successfully sent data to client");
     Ok(())
