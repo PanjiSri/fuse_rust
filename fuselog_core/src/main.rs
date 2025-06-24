@@ -2,6 +2,7 @@ use fuser::MountOption;
 use fuselog_core::socket::start_listener;
 use fuselog_core::FuseLogFS;
 use std::path::PathBuf;
+use std::env;
 
 const SOCKET_PATH: &str = "/tmp/fuselog.sock";
 
@@ -29,7 +30,8 @@ fn main() {
 
     log::info!("Starting Fuselog on directory: '{}'", root_dir.display());
 
-    if let Err(e) = start_listener(SOCKET_PATH) {
+    let socket_file = env::var("FUSELOG_SOCKET_FILE").unwrap_or_else(|_| SOCKET_PATH.to_string());
+    if let Err(e) = start_listener(&socket_file[..]) {
         log::error!("Failed to start socket listener: {}", e);
         std::process::exit(1);
     }
