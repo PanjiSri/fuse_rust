@@ -2,33 +2,43 @@ use crate::STATEDIFF_LOG;
 use bincode::config;
 use log::{error, info, warn};
 use std::io::{Read, Write};
-use std::thread;
+//use std::thread;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 fn handle_client(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error>> {
     info!("Socket: Client connected");
-    
+
     let mut buffer = [0; 1];
-    
-    stream.read_exact(&mut buffer)?;
-    
-    // TODO: Run client only in a single thread, make persistent
-    match buffer[0] {
-        b'g' => send_statediff(stream),
-        b'c' => clear_statediff(),
-        b'm' => {
-            (|| -> Result<(), Box<dyn std::error::Error>> {
-                println!("[]==========[] CHECKPOINT []==========[] ");
-                Ok(())
-            })()
-        },
-        _ => {
-            (|| -> Result<(), Box<dyn std::error::Error>> {
-                warn!("Socket: Received unknown command: {}", buffer[0] as char);
-                Ok(())
-            })()
+
+    loop {
+        match stream.read_exact(&mut buffer) {
+            Ok(_) => {
+                let result = match buffer[0] {
+                    b'g' => send_statediff(stream.try_clone()?),
+                    b'c' => clear_statediff(),
+                    b'm' => {
+                        println!("[]==========[] CHECKPOINT []==========[] ");
+                        stream.write_all(b"Checkpoint marked")?;
+                        Ok(())
+                    },
+                    _ => {
+                        warn!("Socket: Received unknown command: {}", buffer[0] as char);
+                        stream.write_all(b"Unknown command")?;
+                        Ok(())
+                    }
+                };
+
+                if let Err(e) = result {
+                    error!("Socket: Command error: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Read error or client disconnected: {}", e);
+                break;
+            }
         }
     }
+    Ok(())
 }
 
 pub fn start_listener(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -41,29 +51,24 @@ pub fn start_listener(socket_path: &str) -> Result<(), Box<dyn std::error::Error
     
     info!("Socket listener started at {}", socket_path);
     
-    let socket_path_owned = socket_path.to_string();
-    
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    thread::spawn(move || {
-                        if let Err(e) = handle_client(stream) {
-                            error!("Socket: Error handling client: {}", e);
-                        }
-                        info!("Socket: Client disconnected");
-                    });
-                }
-                Err(e) => {
-                    error!("Socket: Failed to accept connection: {}", e);
-                }
-            }
+    for stream in listener.incoming() {
+        println!("Client connected");
+
+        let res: Result<(), Box<dyn std::error::Error>> = match stream {
+            Ok(stream) => handle_client(stream),
+            Err(e) => {
+                error!("Socket: Error handling client: {}", e);
+                Ok(())
+            },
+        };
+
+        if let Err(e) = res {
+            error!("Socket: Error handling client: {}", e);
         }
-        
-        let _ = std::fs::remove_file(&socket_path_owned);
-        info!("Socket: Listener thread exiting, cleaned up socket file");
-    });
-    
+
+        info!("Socket: Client disconnected");
+    }
+
     Ok(())
 }
 
