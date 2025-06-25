@@ -2,6 +2,8 @@ use fuser::MountOption;
 use fuselog_core::socket::start_listener;
 use fuselog_core::FuseLogFS;
 use std::path::PathBuf;
+use std::env;
+use std::thread;
 
 const SOCKET_PATH: &str = "/tmp/fuselog.sock";
 
@@ -29,10 +31,17 @@ fn main() {
 
     log::info!("Starting Fuselog on directory: '{}'", root_dir.display());
 
-    if let Err(e) = start_listener(SOCKET_PATH) {
-        log::error!("Failed to start socket listener: {}", e);
-        std::process::exit(1);
-    }
+    let socket_file = env::var("FUSELOG_SOCKET_FILE").unwrap_or_else(|_| SOCKET_PATH.to_string());
+
+    let listener_handle = thread::spawn({
+        let socket_file = socket_file.clone();
+        move || {
+            if let Err(e) = start_listener(&socket_file[..]) {
+                log::error!("Failed to start socket listener: {}", e);
+                std::process::exit(1);
+            }
+        }
+    });
 
     if let Err(e) = std::env::set_current_dir(&root_dir) {
         log::error!("Failed to change directory to '{}': {}", root_dir.display(), e);
@@ -49,4 +58,8 @@ fn main() {
     let fs = FuseLogFS::new(root_dir.clone());
 
     fuser::mount2(fs, &root_dir, &options).unwrap();
+
+    if let Err(e) = listener_handle.join() {
+        log::error!("Listener thread panicked: {:?}", e);
+    }
 }

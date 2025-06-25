@@ -1,16 +1,15 @@
 use fuselog_core::statediff::{StateDiffAction, StateDiffLog};
 use log::{error, info, warn};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
-
-const SOCKET_PATH: &str = "/tmp/fuselog.sock";
+use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let target_dir = std::env::args()
+    let target_dir = env::args()
         .nth(1)
         .expect("Usage: fuselog-apply <target_directory>");
     
@@ -23,18 +22,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Target path '{}' exists but is not a directory.", target_dir);
         std::process::exit(1);
     }
-    
+
+    let Some(diff_file) = env::args().skip(2).next() else {
+        error!("Not enough arguments.");
+        std::process::exit(1);
+    };
+
+    let Some(diff_path) = diff_file.strip_prefix("--statediff=") else {
+        error!("statediff file is not specified.");
+        std::process::exit(1);
+    };
+
     info!("Applying changes to target directory: {}", target_dir);
+    info!("Reading state diff from file: {}", diff_path);
 
-    info!("Connecting to fuselog socket at {}", SOCKET_PATH);
-    let mut stream = UnixStream::connect(SOCKET_PATH)
-        .map_err(|e| format!("Failed to connect to socket: {}. Is fuselog_core running?", e))?;
-
-    info!("Requesting state diff log...");
-    stream.write_all(b"g")?;
+    let mut file = File::open(diff_path)
+        .map_err(|e| format!("Failed to open diff file '{}': {}", diff_path, e))?;
 
     let mut buffer = Vec::new();
-    stream.read_to_end(&mut buffer)?;
+    file.read_to_end(&mut buffer)?;
     info!("Received {} bytes of data", buffer.len());
 
     if buffer.is_empty() {
