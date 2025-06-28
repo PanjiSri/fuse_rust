@@ -6,7 +6,7 @@ use fuser::{
     ReplyOpen, ReplyWrite, ReplyCreate, Request, TimeOrNow,
 };
 use libc::{ENOENT, EIO, EEXIST};
-use log::{debug, info, error, warn};
+use log::{debug, info, error, warn, trace};
 use statediff::{StateDiffAction, StateDiffLog};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -391,13 +391,22 @@ impl Filesystem for FuseLogFS {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         debug!("open(ino={})", ino);
-        reply.opened(0, 0);
+
+        let mut open_flag = 0;
+
+        if (flags & libc::O_DIRECT as i32) != 0 {
+            info!("O_DIRECT flag detected for ino {}, enabling FOPEN_DIRECT_IO", ino);
+            open_flag |= fuser::consts::FOPEN_DIRECT_IO;
+        }
+
+        reply.opened(0, open_flag);
+        trace!("open(ino={}) - EXIT (OK)", ino);
     }
 
     fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
-        debug!("create(parent={}, name={:?}, mode={:o}, uid={}, gid={})", parent, name, mode, req.uid(), req.gid());
+        trace!("create(parent={}, name={:?}, flags=0x{:x}) - ENTER", parent, name, flags);
         
         let mut inodes = self.inodes.lock().unwrap();
         
@@ -405,15 +414,26 @@ impl Filesystem for FuseLogFS {
             Some(p) => p.clone(),
             None => {
                 reply.error(ENOENT);
+                trace!("create({:?}) - EXIT (ENOENT parent)", name);
                 return;
             }
         };
         
         let file_path = parent_path.join(name);
         let relative_path = self.get_relative_path(&file_path);
-        
-        match std::fs::File::create(&file_path) {
-            Ok(_) => { 
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true);
+
+        if (flags & libc::O_EXCL as i32) != 0 {
+            // O_EXCL (fail if file already exists)
+            options.create_new(true); 
+        } else if (flags & libc::O_TRUNC as i32) != 0 {
+            options.truncate(true);
+        }
+
+        match options.open(&file_path) {
+            Ok(_file) => { 
                 if let Err(e) = std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(mode)) {
                     warn!("Warning: failed to set file permissions for {:?}: {}", &file_path, e);
                 }
@@ -422,6 +442,7 @@ impl Filesystem for FuseLogFS {
                     error!("Failed to chown new file {:?}: {}. Cleaning up.", &file_path, e);
                     let _ = std::fs::remove_file(&file_path);
                     reply.error(e.raw_os_error().unwrap_or(EIO));
+                    trace!("create({:?}) - EXIT (EIO on chown)", name);
                     return;
                 }
 
@@ -441,12 +462,29 @@ impl Filesystem for FuseLogFS {
 
                 if let Ok(metadata) = std::fs::metadata(&file_path) {
                     let attrs = metadata_to_file_attr(ino, &metadata);
-                    reply.created(&TTL, &attrs, 0, ino, flags as u32);
+                    
+                    // FIX : Handle O_DIRECT flag correctly
+                    let mut open_flags = 0;
+                    if (flags & libc::O_DIRECT as i32) != 0 {
+                        info!("O_DIRECT flag detected on create for {:?}, enabling FOPEN_DIRECT_IO", file_path);
+                        open_flags |= fuser::consts::FOPEN_DIRECT_IO;
+                    }
+                    
+                    reply.created(&TTL, &attrs, 0, 0, open_flags);
+                    trace!("create({:?}) - EXIT (OK)", name);
                 } else {
                     reply.error(EIO);
+                    trace!("create({:?}) - EXIT (EIO on metadata)", name);
                 }
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                reply.error(EEXIST);
+                trace!("create({:?}) - EXIT (EEXIST)", name);
+            }
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(EIO));
+                trace!("create({:?}) - EXIT (EIO on open)", name);
+            },
         }
     }
 
