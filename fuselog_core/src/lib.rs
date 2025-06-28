@@ -722,7 +722,7 @@ impl Filesystem for FuseLogFS {
             
             // Use lchown for symlinks, chown for other file types
             let chown_result = if current_meta.file_type().is_symlink() {
-                std::os::unix::fs::chown(&path, Some(final_uid), Some(final_gid))
+                std::os::unix::fs::lchown(&path, Some(final_uid), Some(final_gid))
             } else {
                 std::os::unix::fs::chown(&path, Some(final_uid), Some(final_gid))
             };
