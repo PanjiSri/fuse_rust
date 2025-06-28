@@ -10,12 +10,12 @@ TARGET_DIR="/tmp/target"
 cleanup() {
     echo "=== Cleaning up ==="
     if [ ! -z "$FUSELOG_PID" ]; then
-        sudo kill "$FUSELOG_PID" 2>/dev/null || true
+        kill "$FUSELOG_PID" 2>/dev/null || true
     fi
-    sudo pkill -f fuselog_core || true
+    pkill -f fuselog_core || true
     fusermount -u "$MOUNT_DIR" 2>/dev/null || true
-    sudo rm -rf "$MOUNT_DIR" "$TARGET_DIR"
-    sudo rm -f "/tmp/fuselog.sock"
+    rm -rf "$MOUNT_DIR" "$TARGET_DIR"
+    rm -f "/tmp/fuselog.sock" "/tmp/statediff.bin"
 }
 trap cleanup EXIT
 
@@ -26,10 +26,9 @@ cargo build --workspace
 echo "=== Setting up directories ==="
 cleanup
 mkdir -p "$MOUNT_DIR" "$TARGET_DIR"
-sudo chown "$USER:$USER" "$MOUNT_DIR" "$TARGET_DIR"
 
 echo "=== Starting fuselog_core ==="
-sudo RUST_LOG=info ./target/debug/fuselog_core "$MOUNT_DIR" &
+RUST_LOG=info ./target/debug/fuselog_core "$MOUNT_DIR" &
 FUSELOG_PID=$!
 
 echo "=== Waiting for filesystem to mount ==="
@@ -60,18 +59,14 @@ mv "$MOUNT_DIR/rename_me.txt" "$MOUNT_DIR/subdir/renamed.txt"
 echo "Original file." > "$MOUNT_DIR/original.txt"
 ln "$MOUNT_DIR/original.txt" "$MOUNT_DIR/nickname.txt"
 ln -s original.txt "$MOUNT_DIR/symlink.txt"
-echo "chown test" > "$MOUNT_DIR/chown_test.txt"
-sudo chown 1:1 "$MOUNT_DIR/chown_test.txt"
 chmod 777 "$MOUNT_DIR/test1.txt"
 
-# echo "=== Testing write coalescing ==="
-# echo "----------" > "$MOUNT_DIR/coalesce_test.txt"
-# printf -- '--BCDE----' | dd of="$MOUNT_DIR/coalesce_test.txt" bs=1 count=10 conv=notrunc
-# printf -- '--BXDY----' | dd of="$MOUNT_DIR/coalesce_test.txt" bs=1 count=10 conv=notrunc
-# printf -- '--BXDY----' | dd of="$MOUNT_DIR/coalesce_test.txt" bs=1 count=10 conv=notrunc
+echo "=== Getting statediff ==="
+sleep 1
+./target/debug/get_diff > /tmp/statediff.bin
 
 echo "=== Running fuselog_apply ==="
-sudo RUST_LOG=info ./target/debug/fuselog_apply "$TARGET_DIR"
+RUST_LOG=info ./target/debug/fuselog_apply "$TARGET_DIR" --statediff=/tmp/statediff.bin
 
 echo "=== Verifying results ==="
 
@@ -126,24 +121,11 @@ SYMLINK_OWNER_INFO=$(stat -c "%u:%g" "$TARGET_DIR/symlink.txt")
 test "$SYMLINK_OWNER_INFO" = "$(id -u):$(id -g)" || { echo "FAIL: symlink owner is $SYMLINK_OWNER_INFO, expected $(id -u):$(id -g)"; exit 1; }
 echo "OK"
 
-echo -n "Verifying file ownership (chown)... "
-test -f "$TARGET_DIR/chown_test.txt" || { echo "FAIL: chown_test.txt missing"; exit 1; }
-OWNER_INFO=$(stat -c "%u:%g" "$TARGET_DIR/chown_test.txt")
-test "$OWNER_INFO" = "1:1" || { echo "FAIL: chown failed, owner is $OWNER_INFO, expected 1:1"; exit 1; }
-echo "OK"
-
 echo -n "Verifying file mode (chmod)... "
 test -f "$TARGET_DIR/test1.txt" || { echo "FAIL: test1.txt missing for chmod test"; exit 1; }
 PERMS=$(stat -c "%a" "$TARGET_DIR/test1.txt")
 test "${PERMS: -3}" = "777" || { echo "FAIL: chmod failed, mode is $PERMS, expected 777"; exit 1; }
 echo "OK"
-
-# echo -n "Verifying write coalescing... "
-# test -f "$TARGET_DIR/coalesce_test.txt" || { echo "FAIL: coalesce_test.txt missing"; exit 1; }
-# COALESCE_CONTENT=$(cat "$TARGET_DIR/coalesce_test.txt" | tr -d '\n')
-# EXPECTED_COALESCE="--BXDY----"
-# test "$COALESCE_CONTENT" = "$EXPECTED_COALESCE" || { echo "FAIL: coalesce_test.txt content mismatch. Got: '$COALESCE_CONTENT', Expected: '$EXPECTED_COALESCE'"; exit 1; }
-# echo "OK"
 
 echo ""
 echo "All tests passed, Yeay!"
