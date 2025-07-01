@@ -12,3 +12,4 @@ log = "0.4.27"
 once_cell = "1.21.3"
 serde = {version = "1.0.219", features = ["derive"]}
 uds = "0.4.2"
+zstd = "0.13.3"

@@ -48,10 +48,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let compression_header = buffer[0];
+    let bincode_slice = match compression_header {
+        b'z' => {
+            info!("Detected zstd compressed data. Decompressing...");
+            zstd::decode_all(&buffer[1..])
+                .map_err(|e| format!("Failed to decompress zstd data: {}", e))?
+        },
+        b'n' => {
+            info!("Detected raw data.");
+            buffer[1..].to_vec()
+        },
+        _ => {
+            return Err(format!("Unknown compression header: '{}'. Expected 'z' or 'n'.", compression_header as char).into());
+        }
+    };
+
+
     let (log, _): (StateDiffLog, usize) = bincode::decode_from_slice(
-        &buffer, 
+        &bincode_slice, 
         bincode::config::standard()
-    )?;
+    ).map_err(|e| format!("Failed to deserialize bincode data: {}", e))?;
     
     info!("Deserialized log with {} actions and {} file mappings", 
           log.actions.len(), log.fid_map.len());
