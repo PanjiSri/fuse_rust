@@ -5,6 +5,7 @@ use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::env;
 
 #[derive(Default)]
 struct PruneState {
@@ -193,10 +194,32 @@ fn send_statediff(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Erro
 
         prune_log(&mut log);
 
-        let data = bincode::encode_to_vec(&*log, config::standard()).map_err(|e| {
+        let bincode_data = bincode::encode_to_vec(&*log, config::standard()).map_err(|e| {
             error!("Socket: Failed to serialize statediff log: {}", e);
             std::io::Error::new(std::io::ErrorKind::Other, format!("Serialization failed: {}", e))
         })?;
+
+        let compression_enabled = env::var("FUSELOG_COMPRESSION")
+            .map_or(false, |val| val.to_lowercase() == "true" || val == "1");
+
+                let final_payload = if compression_enabled && !bincode_data.is_empty() {
+                    info!("Compression enabled. Compressing {} bytes of data.", bincode_data.len());
+                        let compressed_data = zstd::encode_all(bincode_data.as_slice(), 0)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Zstd compression failed: {}", e)))?;
+                            
+                        info!("Data compressed to {} bytes.", compressed_data.len());
+                
+                        let mut payload = Vec::with_capacity(1 + compressed_data.len());
+                        payload.push(b'z'); 
+                        payload.extend(compressed_data);
+                        payload
+                    } else {
+                        info!("Compression is disabled or data is empty. Sending raw data.");
+                        let mut payload = Vec::with_capacity(1 + bincode_data.len());
+                        payload.push(b'n'); 
+                        payload.extend(bincode_data);
+                payload
+        };        
 
         let action_count = log.actions.len();
         let fid_count = log.fid_map.len();
@@ -206,7 +229,7 @@ fn send_statediff(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Erro
         info!("Socket: Original statediff log had {} actions, {} fids. Pruned to {} actions, {} fids.",
             original_action_count, original_fid_count, action_count, fid_count);
 
-        data
+        final_payload
     };
 
     // Send stateDiff size first
