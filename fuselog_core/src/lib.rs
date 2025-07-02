@@ -116,8 +116,9 @@ pub struct FuseLogFS {
 impl FuseLogFS {
     pub fn new(_root: PathBuf) -> Self {
 
+        // Write coalesing is disabled by default
         let coalescing_enabled = std::env::var("WRITE_COALESCING")
-        .map_or(true, |val| val.to_lowercase() != "false" && val != "0");
+            .map_or(false, |val| val.to_lowercase() == "true" || val == "1");
 
         if coalescing_enabled {
             info!("Write coalescing is enabled.");

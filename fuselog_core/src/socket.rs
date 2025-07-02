@@ -192,17 +192,29 @@ fn send_statediff(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Erro
         let original_action_count = log.actions.len();
         let original_fid_count = log.fid_map.len();
 
-        prune_log(&mut log);
+        // Pruning is disabled by default
+        let is_prune_enabled = env::var("FUSELOG_PRUNE")
+            .map_or(false, |val| val.to_lowercase() == "true" || val == "1");
+
+        if is_prune_enabled {
+            info!("=========================================");
+            info!("Pruning enabled. Pruning statediff log...");
+            info!("==========================================");
+            prune_log(&mut log);
+        } else {
+            info!("Pruning is disabled. Skipping pruning of statediff log.");
+        }
 
         let bincode_data = bincode::encode_to_vec(&*log, config::standard()).map_err(|e| {
             error!("Socket: Failed to serialize statediff log: {}", e);
             std::io::Error::new(std::io::ErrorKind::Other, format!("Serialization failed: {}", e))
         })?;
 
+        // Compression is disabled by default
         let compression_enabled = env::var("FUSELOG_COMPRESSION")
             .map_or(false, |val| val.to_lowercase() == "true" || val == "1");
 
-                let final_payload = if compression_enabled && !bincode_data.is_empty() {
+        let final_payload = if compression_enabled && !bincode_data.is_empty() {
                     info!("Compression enabled. Compressing {} bytes of data.", bincode_data.len());
                         let compressed_data = zstd::encode_all(bincode_data.as_slice(), 0)
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Zstd compression failed: {}", e)))?;
