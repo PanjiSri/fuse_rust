@@ -215,21 +215,31 @@ fn send_statediff(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Erro
             .map_or(false, |val| val.to_lowercase() == "true" || val == "1");
 
         let final_payload = if compression_enabled && !bincode_data.is_empty() {
-                    info!("Compression enabled. Compressing {} bytes of data.", bincode_data.len());
-                        let compressed_data = zstd::encode_all(bincode_data.as_slice(), 0)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Zstd compression failed: {}", e)))?;
-                            
-                        info!("Data compressed to {} bytes.", compressed_data.len());
-                
-                        let mut payload = Vec::with_capacity(1 + compressed_data.len());
-                        payload.push(b'z'); 
-                        payload.extend(compressed_data);
-                        payload
-                    } else {
-                        info!("Compression is disabled or data is empty. Sending raw data.");
-                        let mut payload = Vec::with_capacity(1 + bincode_data.len());
-                        payload.push(b'n'); 
-                        payload.extend(bincode_data);
+            let adaptive_enabled = env::var("ADAPTIVE_COMPRESSION")
+                .map_or(false, |val| val.to_lowercase() == "true" || val == "1");
+
+            if adaptive_enabled {
+                info!("Adaptive compression enabled (placeholder). Using standard compression for now.");
+                // This is the placeholder for future adaptive logic.
+                // For now, it behaves identically to the 'else' block.
+            } else {
+                info!("Standard zstd compression enabled.");
+            }
+
+            let compressed_data = zstd::encode_all(bincode_data.as_slice(), 0)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Zstd compression failed: {}", e)))?;
+
+            info!("Data compressed from {} to {} bytes.", bincode_data.len(), compressed_data.len());
+
+            let mut payload = Vec::with_capacity(1 + compressed_data.len());
+            payload.push(b'z');
+            payload.extend(compressed_data);
+            payload
+        } else {
+            info!("Compression is disabled or data is empty. Sending raw data.");
+            let mut payload = Vec::with_capacity(1 + bincode_data.len());
+            payload.push(b'n');
+            payload.extend(bincode_data);
                 payload
         };        
 
