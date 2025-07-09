@@ -1,10 +1,14 @@
 use fuselog_core::statediff::{StateDiffAction, StateDiffLog};
 use log::{error, info, warn};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 use std::env;
+use std::sync::Arc;
+use zstd::stream::read::Decoder;
+
+const CACHE_DICT_PATH: &str = "/tmp/statediff.dict";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -48,22 +52,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let compression_header = buffer[0];
-    let bincode_slice = match compression_header {
-        b'z' => {
-            info!("Detected zstd compressed data. Decompressing...");
-            zstd::decode_all(&buffer[1..])
-                .map_err(|e| format!("Failed to decompress zstd data: {}", e))?
-        },
-        b'n' => {
-            info!("Detected raw data.");
-            buffer[1..].to_vec()
-        },
-        _ => {
-            return Err(format!("Unknown compression header: '{}'. Expected 'z' or 'n'.", compression_header as char).into());
-        }
-    };
+    let mut cursor = Cursor::new(&buffer);
+    let mut header_buf = [0; 1];
+    cursor.read_exact(&mut header_buf)?;
+    let compression_header = header_buf[0];
 
+    let bincode_slice = match compression_header {
+        b'd' => {
+            info!("Received payload with new dictionary.");
+            let mut len_buf = [0; 4];
+            cursor.read_exact(&mut len_buf)?;
+            let dict_len = u32::from_le_bytes(len_buf) as usize;
+
+            let dict_start = cursor.position() as usize;
+            let dict_end = dict_start + dict_len;
+            let dict_data = &cursor.get_ref()[dict_start..dict_end];
+
+            info!("Saving new {} byte dictionary to '{}'", dict_len, CACHE_DICT_PATH);
+            std::fs::write(CACHE_DICT_PATH, dict_data)?;
+            let new_dict = Arc::new(dict_data.to_vec());
+
+            cursor.set_position(dict_end as u64);
+            
+            cursor.read_exact(&mut header_buf)?;
+            let data_start = cursor.position() as usize;
+            let compressed_log_data = &cursor.get_ref()[data_start..];
+
+            if header_buf[0] != b'z' {
+                return Err("Expected zstd compressed data after dictionary payload".into());
+            }
+
+            info!("Decompressing log data using the new dictionary.");
+            decompress_with_dictionary(compressed_log_data, &new_dict)?
+        }
+        b'z' => {
+            let data_start = cursor.position() as usize;
+            let compressed_data = &cursor.get_ref()[data_start..];
+
+            info!("Received zstd compressed data. Attempting to decompress with cached dictionary.");
+            let dict = std::fs::read(CACHE_DICT_PATH).ok();
+            if let Some(d) = &dict {
+                decompress_with_dictionary(compressed_data, d)?
+            } else {
+                warn!("No dictionary found at '{}'. Using standard decompression.", CACHE_DICT_PATH);
+                zstd::decode_all(compressed_data)?
+            }
+        }
+        b'n' => {
+            info!("Received uncompressed data.");
+            let data_start = cursor.position() as usize;
+            cursor.get_ref()[data_start..].to_vec()
+        }
+        _ => return Err(format!("Unknown protocol header: '{}'", compression_header as char).into()),
+    };
 
     let (log, _): (StateDiffLog, usize) = bincode::decode_from_slice(
         &bincode_slice, 
@@ -115,6 +156,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Successfully applied all {} actions", log.actions.len());
     Ok(())
+}
+
+fn decompress_with_dictionary(compressed_data: &[u8], dict: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let cursor = Cursor::new(compressed_data);
+    let mut decoder = Decoder::with_dictionary(cursor, dict)?;
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
 }
 
 fn get_full_path(log: &StateDiffLog, fid: u64, target_path: &Path) -> Result<PathBuf, String> {
