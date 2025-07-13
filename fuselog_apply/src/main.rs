@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 use std::env;
 
+const CACHE_DICT_PATH: &str = "/var/cache/fuselog/statediff.dict";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
@@ -50,17 +52,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let compression_header = buffer[0];
     let bincode_slice = match compression_header {
+        b'd' => {
+            info!("Detected payload with dictionary.");
+            
+            if buffer.len() < 5 {
+                return Err("Invalid dictionary payload: too short".into());
+            }
+            
+            // Read dictionary length (4 bytes after header)
+            let dict_len = u32::from_le_bytes([
+                buffer[1], buffer[2], buffer[3], buffer[4]
+            ]) as usize;
+            
+            let dict_start = 5;
+            let dict_end = dict_start + dict_len;
+            
+            if buffer.len() < dict_end + 1 {
+                return Err("Invalid dictionary payload: truncated".into());
+            }
+            
+            let dict_data = &buffer[dict_start..dict_end];
+            
+            info!("Received {} byte dictionary", dict_len);
+            
+            // Create directory if it doesn't exist
+            if let Some(parent) = Path::new(CACHE_DICT_PATH).parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create dictionary directory: {}", e))?;
+            }
+            
+            // Save dictionary to persistent location
+            std::fs::write(CACHE_DICT_PATH, dict_data)
+                .map_err(|e| format!("Failed to save dictionary: {}", e))?;
+            
+            info!("Dictionary saved to {}", CACHE_DICT_PATH);
+            
+            // Check for compressed data header
+            if buffer[dict_end] != b'z' {
+                return Err("Expected compressed data after dictionary".into());
+            }
+            
+            // Remaining data is compressed
+            let compressed_data = &buffer[dict_end + 1..];
+            
+            info!("Decompressing with dictionary...");
+            let mut decoder = zstd::stream::read::Decoder::with_dictionary(
+                std::io::Cursor::new(compressed_data),
+                dict_data
+            )?;
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            decompressed
+        }
         b'z' => {
-            info!("Detected zstd compressed data. Decompressing...");
-            zstd::decode_all(&buffer[1..])
-                .map_err(|e| format!("Failed to decompress zstd data: {}", e))?
-        },
+            info!("Detected zstd compressed data.");
+            
+            // Try to load existing dictionary if available
+            match std::fs::read(CACHE_DICT_PATH) {
+                Ok(dict_data) => {
+                    info!("Found cached dictionary at {}, using it for decompression", CACHE_DICT_PATH);
+                    let compressed_data = &buffer[1..];
+                    let mut decoder = zstd::stream::read::Decoder::with_dictionary(
+                        std::io::Cursor::new(compressed_data),
+                        &dict_data
+                    )?;
+                    let mut decompressed = Vec::new();
+                    decoder.read_to_end(&mut decompressed)?;
+                    decompressed
+                }
+                Err(_) => {
+                    info!("No cached dictionary found, using standard decompression");
+                    zstd::decode_all(&buffer[1..])?
+                }
+            }
+        }
         b'n' => {
             info!("Detected raw data.");
             buffer[1..].to_vec()
-        },
+        }
         _ => {
-            return Err(format!("Unknown compression header: '{}'. Expected 'z' or 'n'.", compression_header as char).into());
+            return Err(format!("Unknown compression header: '{}'. Expected 'd', 'z', or 'n'.", compression_header as char).into());
         }
     };
 
