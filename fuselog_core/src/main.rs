@@ -4,31 +4,85 @@ use fuselog_core::FuseLogFS;
 use std::path::PathBuf;
 use std::env;
 use std::thread;
+use std::fs::File;
+use daemonize::Daemonize;
 
 const SOCKET_PATH: &str = "/tmp/fuselog.sock";
 
 fn main() {
-    env_logger::init();
-
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <directory>", args[0]);
+    
+    let foreground = args.iter().any(|arg| arg == "-f" || arg == "--foreground");
+    
+    let filtered_args: Vec<String> = args.into_iter()
+        .filter(|arg| arg != "-f" && arg != "--foreground")
+        .collect();
+    
+    if filtered_args.len() != 2 {
+        eprintln!("Usage: {} [-f|--foreground] <directory>", filtered_args[0]);
         std::process::exit(1);
     }
 
-    let root_dir = PathBuf::from(&args[1]);
+    let root_dir = PathBuf::from(&filtered_args[1]);
 
     if !root_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&root_dir) {
-            log::error!("Failed to create directory '{}': {}", root_dir.display(), e);
+            eprintln!("Failed to create directory '{}': {}", root_dir.display(), e);
             std::process::exit(1);
         }
-        log::info!("Created directory: {}", root_dir.display());
+        println!("Created directory: {}", root_dir.display());
     } else if !root_dir.is_dir() {
-        log::error!("Path '{}' exists but is not a directory", root_dir.display());
+        eprintln!("Path '{}' exists but is not a directory", root_dir.display());
         std::process::exit(1);
     }
 
+    if foreground {
+        env_logger::init();
+        log::info!("Starting Fuselog in foreground mode on directory: '{}'", root_dir.display());
+        run_fuse_logic(root_dir);
+    } else {
+        let stdout = match File::create("/tmp/fuselog.out") {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("Failed to create stdout log file: {}", e);
+                std::process::exit(1);
+            }
+        };
+        
+        let stderr = match File::create("/tmp/fuselog.err") {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("Failed to create stderr log file: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // Create PID file name based on mount point
+        let pid_file = format!("/tmp/fuselog_{}.pid", 
+            root_dir.to_string_lossy().replace("/", "_").replace(" ", "_"));
+
+        let daemonize = Daemonize::new()
+            .pid_file(pid_file)
+            .chown_pid_file(true)
+            .working_directory(&root_dir)
+            .stdout(stdout)
+            .stderr(stderr);
+
+        match daemonize.start() {
+            Ok(_) => {
+                env_logger::init();
+                log::info!("Successfully daemonized fuselog for directory: '{}'", root_dir.display());
+                run_fuse_logic(root_dir);
+            }
+            Err(e) => {
+                eprintln!("Error daemonizing: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn run_fuse_logic(root_dir: PathBuf) {
     log::info!("Starting Fuselog on directory: '{}'", root_dir.display());
 
     let socket_file = env::var("FUSELOG_SOCKET_FILE").unwrap_or_else(|_| SOCKET_PATH.to_string());
@@ -57,7 +111,10 @@ fn main() {
 
     let fs = FuseLogFS::new(root_dir.clone());
 
-    fuser::mount2(fs, &root_dir, &options).unwrap();
+    if let Err(e) = fuser::mount2(fs, &root_dir, &options) {
+        log::error!("Failed to mount FUSE filesystem: {}", e);
+        std::process::exit(1);
+    }
 
     if let Err(e) = listener_handle.join() {
         log::error!("Listener thread panicked: {:?}", e);
