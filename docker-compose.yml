@@ -1,0 +1,13 @@
+name: bookcatalog-nd
+services:
+  app:
+    container_name: app
+    image: michael2718/bookcatalog-nd:1
+    ports:
+       - 8000:8000
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /tmp/fuse_my/
+        target: /data/                     
+      - /etc/passwd:/etc/passwd:ro

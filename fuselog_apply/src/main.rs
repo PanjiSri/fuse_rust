@@ -1,16 +1,17 @@
 use fuselog_core::statediff::{StateDiffAction, StateDiffLog};
 use log::{error, info, warn};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
+use std::env;
 
-const SOCKET_PATH: &str = "/tmp/fuselog.sock";
+const CACHE_DICT_PATH: &str = "/var/cache/fuselog/statediff.dict";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let target_dir = std::env::args()
+    let target_dir = env::args()
         .nth(1)
         .expect("Usage: fuselog-apply <target_directory>");
     
@@ -23,18 +24,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Target path '{}' exists but is not a directory.", target_dir);
         std::process::exit(1);
     }
-    
+
+    let Some(diff_file) = env::args().skip(2).next() else {
+        error!("Not enough arguments.");
+        std::process::exit(1);
+    };
+
+    let Some(diff_path) = diff_file.strip_prefix("--statediff=") else {
+        error!("statediff file is not specified.");
+        std::process::exit(1);
+    };
+
     info!("Applying changes to target directory: {}", target_dir);
+    info!("Reading state diff from file: {}", diff_path);
 
-    info!("Connecting to fuselog socket at {}", SOCKET_PATH);
-    let mut stream = UnixStream::connect(SOCKET_PATH)
-        .map_err(|e| format!("Failed to connect to socket: {}. Is fuselog_core running?", e))?;
-
-    info!("Requesting state diff log...");
-    stream.write_all(b"g")?;
+    let mut file = File::open(diff_path)
+        .map_err(|e| format!("Failed to open diff file '{}': {}", diff_path, e))?;
 
     let mut buffer = Vec::new();
-    stream.read_to_end(&mut buffer)?;
+    file.read_to_end(&mut buffer)?;
     info!("Received {} bytes of data", buffer.len());
 
     if buffer.is_empty() {
@@ -42,10 +50,96 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let compression_header = buffer[0];
+    let bincode_slice = match compression_header {
+        b'd' => {
+            info!("Detected payload with dictionary.");
+            
+            if buffer.len() < 5 {
+                return Err("Invalid dictionary payload: too short".into());
+            }
+            
+            // Read dictionary length (4 bytes after header)
+            let dict_len = u32::from_le_bytes([
+                buffer[1], buffer[2], buffer[3], buffer[4]
+            ]) as usize;
+            
+            let dict_start = 5;
+            let dict_end = dict_start + dict_len;
+            
+            if buffer.len() < dict_end + 1 {
+                return Err("Invalid dictionary payload: truncated".into());
+            }
+            
+            let dict_data = &buffer[dict_start..dict_end];
+            
+            info!("Received {} byte dictionary", dict_len);
+            
+            // Create directory if it doesn't exist
+            if let Some(parent) = Path::new(CACHE_DICT_PATH).parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create dictionary directory: {}", e))?;
+            }
+            
+            // Save dictionary to persistent location
+            std::fs::write(CACHE_DICT_PATH, dict_data)
+                .map_err(|e| format!("Failed to save dictionary: {}", e))?;
+            
+            info!("Dictionary saved to {}", CACHE_DICT_PATH);
+            
+            // Check for compressed data header
+            if buffer[dict_end] != b'z' {
+                return Err("Expected compressed data after dictionary".into());
+            }
+            
+            // Remaining data is compressed
+            let compressed_data = &buffer[dict_end + 1..];
+            
+            info!("Decompressing with dictionary...");
+            let mut decoder = zstd::stream::read::Decoder::with_dictionary(
+                std::io::Cursor::new(compressed_data),
+                dict_data
+            )?;
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            decompressed
+        }
+        b'z' => {
+            info!("Detected zstd compressed data.");
+            
+            // Try to load existing dictionary if available
+            match std::fs::read(CACHE_DICT_PATH) {
+                Ok(dict_data) => {
+                    info!("Found cached dictionary at {}, using it for decompression", CACHE_DICT_PATH);
+                    let compressed_data = &buffer[1..];
+                    let mut decoder = zstd::stream::read::Decoder::with_dictionary(
+                        std::io::Cursor::new(compressed_data),
+                        &dict_data
+                    )?;
+                    let mut decompressed = Vec::new();
+                    decoder.read_to_end(&mut decompressed)?;
+                    decompressed
+                }
+                Err(_) => {
+                    info!("No cached dictionary found, using standard decompression");
+                    zstd::decode_all(&buffer[1..])?
+                }
+            }
+        }
+        b'n' => {
+            info!("Detected raw data.");
+            buffer[1..].to_vec()
+        }
+        _ => {
+            return Err(format!("Unknown compression header: '{}'. Expected 'd', 'z', or 'n'.", compression_header as char).into());
+        }
+    };
+
+
     let (log, _): (StateDiffLog, usize) = bincode::decode_from_slice(
-        &buffer, 
+        &bincode_slice, 
         bincode::config::standard()
-    )?;
+    ).map_err(|e| format!("Failed to deserialize bincode data: {}", e))?;
     
     info!("Deserialized log with {} actions and {} file mappings", 
           log.actions.len(), log.fid_map.len());

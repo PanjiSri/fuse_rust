@@ -6,7 +6,7 @@ use fuser::{
     ReplyOpen, ReplyWrite, ReplyCreate, Request, TimeOrNow,
 };
 use libc::{ENOENT, EIO, EEXIST};
-use log::{debug, info, error, warn};
+use log::{debug, info, error, warn, trace};
 use statediff::{StateDiffAction, StateDiffLog};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -110,12 +110,25 @@ impl InodeManager {
 
 pub struct FuseLogFS {
     inodes: Mutex<InodeManager>,
+    write_coalescing: bool,
 }
 
 impl FuseLogFS {
     pub fn new(_root: PathBuf) -> Self {
+
+        // Write coalesing is disabled by default
+        let coalescing_enabled = std::env::var("WRITE_COALESCING")
+            .map_or(false, |val| val.to_lowercase() == "true" || val == "1");
+
+        if coalescing_enabled {
+            info!("Write coalescing is enabled.");
+        } else {
+            info!("Write coalescing is disabled.");
+        }
+
         Self {
             inodes: Mutex::new(InodeManager::new()),
+            write_coalescing : coalescing_enabled,
         }
     }
     
@@ -391,13 +404,22 @@ impl Filesystem for FuseLogFS {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         debug!("open(ino={})", ino);
-        reply.opened(0, 0);
+
+        let mut open_flag = 0;
+
+        if (flags & libc::O_DIRECT as i32) != 0 {
+            info!("O_DIRECT flag detected for ino {}, enabling FOPEN_DIRECT_IO", ino);
+            open_flag |= fuser::consts::FOPEN_DIRECT_IO;
+        }
+
+        reply.opened(0, open_flag);
+        trace!("open(ino={}) - EXIT (OK)", ino);
     }
 
     fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
-        debug!("create(parent={}, name={:?}, mode={:o}, uid={}, gid={})", parent, name, mode, req.uid(), req.gid());
+        trace!("create(parent={}, name={:?}, flags=0x{:x}) - ENTER", parent, name, flags);
         
         let mut inodes = self.inodes.lock().unwrap();
         
@@ -405,15 +427,26 @@ impl Filesystem for FuseLogFS {
             Some(p) => p.clone(),
             None => {
                 reply.error(ENOENT);
+                trace!("create({:?}) - EXIT (ENOENT parent)", name);
                 return;
             }
         };
         
         let file_path = parent_path.join(name);
         let relative_path = self.get_relative_path(&file_path);
-        
-        match std::fs::File::create(&file_path) {
-            Ok(_) => { 
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true);
+
+        if (flags & libc::O_EXCL as i32) != 0 {
+            // O_EXCL (fail if file already exists)
+            options.create_new(true); 
+        } else if (flags & libc::O_TRUNC as i32) != 0 {
+            options.truncate(true);
+        }
+
+        match options.open(&file_path) {
+            Ok(_file) => { 
                 if let Err(e) = std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(mode)) {
                     warn!("Warning: failed to set file permissions for {:?}: {}", &file_path, e);
                 }
@@ -422,6 +455,7 @@ impl Filesystem for FuseLogFS {
                     error!("Failed to chown new file {:?}: {}. Cleaning up.", &file_path, e);
                     let _ = std::fs::remove_file(&file_path);
                     reply.error(e.raw_os_error().unwrap_or(EIO));
+                    trace!("create({:?}) - EXIT (EIO on chown)", name);
                     return;
                 }
 
@@ -441,12 +475,29 @@ impl Filesystem for FuseLogFS {
 
                 if let Ok(metadata) = std::fs::metadata(&file_path) {
                     let attrs = metadata_to_file_attr(ino, &metadata);
-                    reply.created(&TTL, &attrs, 0, ino, flags as u32);
+                    
+                    // FIX : Handle O_DIRECT flag correctly
+                    let mut open_flags = 0;
+                    if (flags & libc::O_DIRECT as i32) != 0 {
+                        info!("O_DIRECT flag detected on create for {:?}, enabling FOPEN_DIRECT_IO", file_path);
+                        open_flags |= fuser::consts::FOPEN_DIRECT_IO;
+                    }
+                    
+                    reply.created(&TTL, &attrs, 0, 0, open_flags);
+                    trace!("create({:?}) - EXIT (OK)", name);
                 } else {
                     reply.error(EIO);
+                    trace!("create({:?}) - EXIT (EIO on metadata)", name);
                 }
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                reply.error(EEXIST);
+                trace!("create({:?}) - EXIT (EEXIST)", name);
+            }
+            Err(e) => {
+                reply.error(e.raw_os_error().unwrap_or(EIO));
+                trace!("create({:?}) - EXIT (EIO on open)", name);
+            },
         }
     }
 
@@ -483,7 +534,7 @@ impl Filesystem for FuseLogFS {
     }
 
     fn write(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
-        debug!("write(ino={}, offset={}, size={})", ino, offset, data.len());
+        debug!("write(ino={}, offset={}, size={}, coalescing={})", ino, offset, data.len(), self.write_coalescing);
 
         let inodes = self.inodes.lock().unwrap();
         let path = match inodes.get_path(ino) {
@@ -494,103 +545,133 @@ impl Filesystem for FuseLogFS {
             }
         };
 
-        // 1. Read the old data
-        let old_data: Vec<u8> = match File::open(&path) {
-            Ok(mut old_file) => {
-                // Seek the offset
-                if old_file.seek(SeekFrom::Start(offset as u64)).is_ok() {
-                    let mut buffer = vec![0; data.len()];
-                    match old_file.read(&mut buffer) {
-                        Ok(bytes_read) => {
-                            buffer.truncate(bytes_read);
-                            buffer
-                        }
-                        Err(_) => Vec::new(),
-                    }
-                } else {
-                    Vec::new()
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
-            Err(_) => Vec::new(),
-        };
-
-        // 2. Perform the actual write to the underlying filesystem.
-        match OpenOptions::new().write(true).create(true).open(&path) {
-            Ok(mut file) => {
-                if let Err(e) = file.seek(SeekFrom::Start(offset as u64)) {
-                    reply.error(e.raw_os_error().unwrap_or(EIO));
-                    return;
-                }
-
-                match file.write_all(data) {
-                    Ok(_) => {
-                        // 3. Comparing old and new data to find and log differences.
-                        let mut coalesced_writes = Vec::new();
-                        let mut i = 0;
-                        while i < data.len() {
-                            let old_byte = old_data.get(i);
-                            let new_byte = data[i];
-    
-                            if old_byte.map_or(true, |&b| b != new_byte) {
-                                let chunk_start_index = i;
-                                let mut chunk_data = vec![new_byte];
-                                i += 1;
-
-                                while i < data.len() {
-                                    let next_old_byte = old_data.get(i);
-                                    let next_new_byte = data[i];
-                                    if next_old_byte.map_or(true, |&b| b != next_new_byte) {
-                                        chunk_data.push(next_new_byte);
-                                        i += 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                
-                                coalesced_writes.push((
-                                    offset as u64 + chunk_start_index as u64,
-                                    chunk_data,
-                                ));
-                            } else {
-                                i += 1;
+        if self.write_coalescing {
+            // 1. Read the old data
+            let old_data: Vec<u8> = match File::open(&path) {
+                Ok(mut old_file) => {
+                    // Seek the offset
+                    if old_file.seek(SeekFrom::Start(offset as u64)).is_ok() {
+                        let mut buffer = vec![0; data.len()];
+                        match old_file.read(&mut buffer) {
+                            Ok(bytes_read) => {
+                                buffer.truncate(bytes_read);
+                                buffer
                             }
+                            Err(_) => Vec::new(),
                         }
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
+                Err(_) => Vec::new(),
+            };
 
-                        if !coalesced_writes.is_empty() {
-                            let total_coalesced_bytes = coalesced_writes.iter().map(|(_, d)| d.len()).sum::<usize>();
-                            info!(
-                                "Coalesced write of {} bytes into {} chunk(s) ({} total bytes) for {:?}",
-                                data.len(),
-                                coalesced_writes.len(),
-                                total_coalesced_bytes,
-                                &path
-                            );
+            // 2. Perform the actual write to the underlying filesystem.
+            match OpenOptions::new().write(true).create(true).open(&path) {
+                Ok(mut file) => {
+                    if let Err(e) = file.seek(SeekFrom::Start(offset as u64)) {
+                        reply.error(e.raw_os_error().unwrap_or(EIO));
+                        return;
+                    }
 
+                    match file.write_all(data) {
+                        Ok(_) => {
+                            // 3. Comparing old and new data to find and log differences.
+                            let mut coalesced_writes = Vec::new();
+                            let mut i = 0;
+                            while i < data.len() {
+                                let old_byte = old_data.get(i);
+                                let new_byte = data[i];
+        
+                                if old_byte.map_or(true, |&b| b != new_byte) {
+                                    let chunk_start_index = i;
+                                    let mut chunk_data = vec![new_byte];
+                                    i += 1;
+
+                                    while i < data.len() {
+                                        let next_old_byte = old_data.get(i);
+                                        let next_new_byte = data[i];
+                                        if next_old_byte.map_or(true, |&b| b != next_new_byte) {
+                                            chunk_data.push(next_new_byte);
+                                            i += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    
+                                    coalesced_writes.push((
+                                        offset as u64 + chunk_start_index as u64,
+                                        chunk_data,
+                                    ));
+                                } else {
+                                    i += 1;
+                                }
+                            }
+
+                            if !coalesced_writes.is_empty() {
+                                let total_coalesced_bytes = coalesced_writes.iter().map(|(_, d)| d.len()).sum::<usize>();
+                                info!(
+                                    "Coalesced write of {} bytes into {} chunk(s) ({} total bytes) for {:?}",
+                                    data.len(),
+                                    coalesced_writes.len(),
+                                    total_coalesced_bytes,
+                                    &path
+                                );
+
+                                let relative_path = self.get_relative_path(&path);
+                                let mut log = STATEDIFF_LOG.lock().unwrap();
+                                let fid = get_fid(&mut log, &relative_path);
+
+                                for (chunk_offset, chunk_data) in coalesced_writes {
+                                    log.actions.push(StateDiffAction::Write {
+                                        fid,
+                                        offset: chunk_offset,
+                                        data: chunk_data,
+                                    });
+                                }
+                            } else {
+                                info!("Redundant write to {:?} (no changes detected), not logging.", &path);
+                            }
+                            
+                            reply.written(data.len() as u32);
+                        }
+                        Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+                    }
+                }
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+            }
+        } else {
+            info!("Write coalescing disabled. Logging full write of {} bytes to {:?}", data.len(), &path);
+
+            match OpenOptions::new().write(true).create(true).open(&path) {
+                Ok(mut file) => {
+                    if let Err(e) = file.seek(SeekFrom::Start(offset as u64)) {
+                        reply.error(e.raw_os_error().unwrap_or(EIO));
+                        return;
+                    }
+
+                    match file.write_all(data) {
+                        Ok(_) => {
                             let relative_path = self.get_relative_path(&path);
                             let mut log = STATEDIFF_LOG.lock().unwrap();
                             let fid = get_fid(&mut log, &relative_path);
+                            
+                            log.actions.push(StateDiffAction::Write {
+                                fid,
+                                offset: offset as u64,
+                                data: data.to_vec(),
+                            });
 
-                            for (chunk_offset, chunk_data) in coalesced_writes {
-                                log.actions.push(StateDiffAction::Write {
-                                    fid,
-                                    offset: chunk_offset,
-                                    data: chunk_data,
-                                });
-                            }
-                        } else {
-                            info!("Redundant write to {:?} (no changes detected), not logging.", &path);
+                            reply.written(data.len() as u32);
                         }
-                        
-                        reply.written(data.len() as u32);
+                        Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
                     }
-                    Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
                 }
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
         }
     }
-
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         debug!("unlink(parent={}, name={:?})", parent, name);
@@ -684,7 +765,7 @@ impl Filesystem for FuseLogFS {
             
             // Use lchown for symlinks, chown for other file types
             let chown_result = if current_meta.file_type().is_symlink() {
-                std::os::unix::fs::chown(&path, Some(final_uid), Some(final_gid))
+                std::os::unix::fs::lchown(&path, Some(final_uid), Some(final_gid))
             } else {
                 std::os::unix::fs::chown(&path, Some(final_uid), Some(final_gid))
             };
