@@ -3,12 +3,14 @@ use crate::STATEDIFF_LOG;
 use bincode::config;
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::env;
 use std::fs;
 use std::thread;
+use std::time::Duration;
 
 // PRODUCTION
 const MIN_SAMPLES: usize = 200;
@@ -104,34 +106,43 @@ fn handle_client(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-pub fn start_listener(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn start_listener(socket_path: &str, shutdown_rx: Receiver<()>) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(socket_path);
     
-    let listener = UnixListener::bind(socket_path).map_err(|e| {
-        error!("Failed to bind to socket at {}: {}", socket_path, e);
-        e
-    })?;
+    let listener = UnixListener::bind(socket_path)?;
+    listener.set_nonblocking(true)?;
     
     info!("Socket listener started at {}", socket_path);
 
     load_existing_dictionary();
 
-    for stream in listener.incoming() {
-        println!("Client connected");
-
-        let res: Result<(), Box<dyn std::error::Error>> = match stream {
-            Ok(stream) => handle_client(stream),
-            Err(e) => {
-                error!("Socket: Error handling client: {}", e);
-                Ok(())
-            },
-        };
-
-        if let Err(e) = res {
-            error!("Socket: Error handling client: {}", e);
+    loop {
+        // Check for shutdown signal without blocking
+        if shutdown_rx.try_recv().is_ok() {
+            info!("Shutdown signal received. Stopping listener.");
+            break;
         }
 
-        info!("Socket: Client disconnected");
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                println!("Client connected");
+
+                if let Err(e) = handle_client(stream) {
+                    error!("Socket: Error handling client: {}", e);
+                }
+
+                info!("Socket: Client disconnected");
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // No client right now — sleep briefly to avoid busy waiting
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => {
+                error!("Socket: Listener error: {}", e);
+                break;
+            }
+        }
     }
 
     Ok(())

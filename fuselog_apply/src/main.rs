@@ -1,8 +1,9 @@
 use fuselog_core::statediff::{StateDiffAction, StateDiffLog};
 use log::{error, info, warn};
-use std::fs::File;
+//use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::net::UnixStream;
 use std::os::unix::fs::PermissionsExt;
 use std::env;
 
@@ -13,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let target_dir = env::args()
         .nth(1)
-        .expect("Usage: fuselog-apply <target_directory>");
+        .expect("Usage: fuselog-apply <target_directory> --applySocket=<socket_file>");
     
     let target_path = Path::new(&target_dir);
     
@@ -30,19 +31,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     };
 
-    let Some(diff_path) = diff_file.strip_prefix("--statediff=") else {
-        error!("statediff file is not specified.");
+    let Some(sock_file) = diff_file.strip_prefix("--applySocket=") else {
+        error!("socket_file is not specified.");
         std::process::exit(1);
     };
 
     info!("Applying changes to target directory: {}", target_dir);
-    info!("Reading state diff from file: {}", diff_path);
+    info!("Reading state diff from socket_file: {}", sock_file);
 
+    let mut stream = UnixStream::connect(sock_file)
+        .map_err(|e| format!("Failed to connect to socket: {}. Is fuselog_core running?", e))?;
+
+    info!("Requesting state diff log...");
+    stream.write_all(b"g")?;
+
+    /*
     let mut file = File::open(diff_path)
         .map_err(|e| format!("Failed to open diff file '{}': {}", diff_path, e))?;
 
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
+    info!("Received {} bytes of data", buffer.len());
+    */
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer)?;
     info!("Received {} bytes of data", buffer.len());
 
     if buffer.is_empty() {
