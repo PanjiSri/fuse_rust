@@ -8,6 +8,6 @@ services:
     restart: unless-stopped
     volumes:
       - type: bind
-        source: /tmp/fuse_my/
+        source: /tmp/fuse/
         target: /data/                     
       - /etc/passwd:/etc/passwd:ro
