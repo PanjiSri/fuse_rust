@@ -9,6 +9,8 @@ use std::fs;
 
 const CACHE_DICT_PATH: &str = "/var/cache/fuselog/statediff.dict";
 
+const CACHE_DICT_PATH: &str = "/var/cache/fuselog/statediff.dict";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 

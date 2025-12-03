@@ -43,29 +43,53 @@ fn main() {
         let exit_code = run_fuse_logic(root_dir);
         std::process::exit(exit_code);
     } else {
-        let stdout = match File::create("/tmp/fuselog.out") {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("Failed to create stdout log file: {}", e);
-                std::process::exit(1);
-            }
-        };
-        
-        let stderr = match File::create("/tmp/fuselog.err") {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("Failed to create stderr log file: {}", e);
-                std::process::exit(1);
-            }
+        // Check if daemon logs are enabled (default: false)
+        let enable_daemon_logs = env::var("FUSELOG_DAEMON_LOGS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let (stdout, stderr) = if enable_daemon_logs {
+            // Try to create log files with better error handling
+            let stdout = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open("/tmp/fuselog.out")
+            {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!("Warning: Failed to create /tmp/fuselog.out: {}. Falling back to /dev/null", e);
+                    File::create("/dev/null").expect("Failed to open /dev/null")
+                }
+            };
+
+            let stderr = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open("/tmp/fuselog.err")
+            {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!("Warning: Failed to create /tmp/fuselog.err: {}. Falling back to /dev/null", e);
+                    File::create("/dev/null").expect("Failed to open /dev/null")
+                }
+            };
+
+            (stdout, stderr)
+        } else {
+            // Default: redirect to /dev/null
+            let devnull_out = File::create("/dev/null").expect("Failed to open /dev/null");
+            let devnull_err = File::create("/dev/null").expect("Failed to open /dev/null");
+            (devnull_out, devnull_err)
         };
 
-        // Create PID file name based on mount point
-        let pid_file = format!("/tmp/fuselog_{}.pid", 
-            root_dir.to_string_lossy().replace("/", "_").replace(" ", "_"));
+        // let pid_file = format!("/tmp/fuselog_{}.pid",
+        //     root_dir.to_string_lossy().replace("/", "_").replace(" ", "_"));
 
         let daemonize = Daemonize::new()
-            .pid_file(pid_file)
-            .chown_pid_file(true)
+            // .pid_file(pid_file)
+            // .chown_pid_file(true)
             .working_directory(&root_dir)
             .stdout(stdout)
             .stderr(stderr);
