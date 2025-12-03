@@ -7,6 +7,7 @@ use fuser::{
 };
 use libc::{ENOENT, EIO, EEXIST};
 use log::{debug, info, error, warn, trace};
+use bincode::{config, encode_to_vec};
 use statediff::{StateDiffAction, StateDiffLog};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -577,6 +578,22 @@ impl Filesystem for FuseLogFS {
 
                     match file.write_all(data) {
                         Ok(_) => {
+
+                            // Compute per action overhead using an empty write action
+                            let fid_for_overhead = {
+                                let mut log = STATEDIFF_LOG.lock().unwrap();
+                                get_fid(&mut log, &self.get_relative_path(&path))
+                            };
+                            let overhead_probe = StateDiffAction::Write {
+                                fid: fid_for_overhead,
+                                offset: 0,
+                                data: Vec::new(),
+                            };
+                            let overhead_bytes = encode_to_vec(&overhead_probe, config::standard())
+                                .map(|v| v.len())
+                                .unwrap_or(0)
+                                .max(1); 
+
                             // 3. Comparing old and new data to find and log differences.
                             let mut coalesced_writes = Vec::new();
                             let mut i = 0;
@@ -596,7 +613,25 @@ impl Filesystem for FuseLogFS {
                                             chunk_data.push(next_new_byte);
                                             i += 1;
                                         } else {
-                                            break;
+                                            let mut match_run = 1;
+                                            while i + match_run < data.len() {
+                                                let further_old = old_data.get(i + match_run);
+                                                let further_new = data[i + match_run];
+                                                if further_old.map_or(true, |&b| b != further_new) {
+                                                    break;
+                                                }
+                                                match_run += 1;
+                                            }
+
+                                            if match_run < overhead_bytes {
+                                                for k in 0..match_run {
+                                                    chunk_data.push(data[i + k]);
+                                                }
+                                                i += match_run;
+                                                continue;
+                                            } else {
+                                                break;
+                                            }
                                         }
                                     }
                                     
