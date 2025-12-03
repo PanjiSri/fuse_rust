@@ -3,12 +3,14 @@ use crate::STATEDIFF_LOG;
 use bincode::config;
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::env;
 use std::fs;
 use std::thread;
+use std::time::Duration;
 
 // PRODUCTION
 const MIN_SAMPLES: usize = 200;
@@ -104,34 +106,43 @@ fn handle_client(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-pub fn start_listener(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn start_listener(socket_path: &str, shutdown_rx: Receiver<()>) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(socket_path);
     
-    let listener = UnixListener::bind(socket_path).map_err(|e| {
-        error!("Failed to bind to socket at {}: {}", socket_path, e);
-        e
-    })?;
+    let listener = UnixListener::bind(socket_path)?;
+    listener.set_nonblocking(true)?;
     
     info!("Socket listener started at {}", socket_path);
 
     load_existing_dictionary();
 
-    for stream in listener.incoming() {
-        println!("Client connected");
-
-        let res: Result<(), Box<dyn std::error::Error>> = match stream {
-            Ok(stream) => handle_client(stream),
-            Err(e) => {
-                error!("Socket: Error handling client: {}", e);
-                Ok(())
-            },
-        };
-
-        if let Err(e) = res {
-            error!("Socket: Error handling client: {}", e);
+    loop {
+        // Check for shutdown signal without blocking
+        if shutdown_rx.try_recv().is_ok() {
+            info!("Shutdown signal received. Stopping listener.");
+            break;
         }
 
-        info!("Socket: Client disconnected");
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                println!("Client connected");
+
+                if let Err(e) = handle_client(stream) {
+                    error!("Socket: Error handling client: {}", e);
+                }
+
+                info!("Socket: Client disconnected");
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // No client right now — sleep briefly to avoid busy waiting
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => {
+                error!("Socket: Listener error: {}", e);
+                break;
+            }
+        }
     }
 
     Ok(())
@@ -286,6 +297,107 @@ fn try_train_dictionary_async(samples: Vec<Vec<u8>>) {
             }
         }
     });
+}
+
+fn prune_log(log: &mut StateDiffLog) {
+    if log.actions.is_empty() {
+        return;
+    }
+
+    let original_action_count = log.actions.len();
+    let original_fid_count = log.fid_map.len();
+
+    let mut actions: Vec<Option<StateDiffAction>> = log.actions.drain(..).map(Some).collect();
+    let mut file_states: HashMap<u64, PruneState> = HashMap::new();
+    let mut fids_to_purge: HashSet<u64> = HashSet::new();
+
+    for i in 0..actions.len() {
+        let action = match &actions[i] {
+            Some(a) => a,
+            None => continue,
+        };
+
+        match action {
+            StateDiffAction::Create { fid, .. }
+            | StateDiffAction::Mkdir { fid }
+            | StateDiffAction::Symlink { link_fid: fid, .. } => {
+                file_states.entry(*fid).or_default().creation_idx = Some(i);
+            }
+            StateDiffAction::Chmod { fid, .. } => {
+                let state = file_states.entry(*fid).or_default();
+                if let Some(prev_idx) = state.last_chmod_idx.replace(i) {
+                    actions[prev_idx] = None;
+                }
+            }
+            StateDiffAction::Chown { fid, .. } => {
+                let state = file_states.entry(*fid).or_default();
+                if let Some(prev_idx) = state.last_chown_idx.replace(i) {
+                    actions[prev_idx] = None; 
+                }
+            }
+            StateDiffAction::Unlink { fid } | StateDiffAction::Rmdir { fid } => {
+                if let Some(state) = file_states.get(fid) {
+                    if state.creation_idx.is_some() {
+                        fids_to_purge.insert(*fid);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut final_actions = Vec::new();
+    let mut used_fids = HashSet::new();
+
+    for action_opt in actions.into_iter() {
+        if let Some(action) = action_opt {
+            let mut action_fids = Vec::new();
+            match &action {
+                StateDiffAction::Create { fid, .. }
+                | StateDiffAction::Write { fid, .. }
+                | StateDiffAction::Unlink { fid }
+                | StateDiffAction::Truncate { fid, .. }
+                | StateDiffAction::Chown { fid, .. }
+                | StateDiffAction::Chmod { fid, .. }
+                | StateDiffAction::Mkdir { fid }
+                | StateDiffAction::Rmdir { fid } => action_fids.push(*fid),
+                StateDiffAction::Symlink { link_fid, .. } => action_fids.push(*link_fid),
+                StateDiffAction::Rename { from_fid, to_fid } => {
+                    action_fids.push(*from_fid);
+                    action_fids.push(*to_fid);
+                }
+                StateDiffAction::Link {
+                    source_fid,
+                    new_link_fid,
+                } => {
+                    action_fids.push(*source_fid);
+                    action_fids.push(*new_link_fid);
+                }
+            };
+
+            if action_fids.iter().any(|fid| fids_to_purge.contains(fid)) {
+                continue;
+            }
+
+            for fid in action_fids {
+                used_fids.insert(fid);
+            }
+            final_actions.push(action);
+        }
+    }
+
+    log.actions = final_actions;
+    log.fid_map.retain(|fid, _| used_fids.contains(fid));
+
+    if log.actions.len() < original_action_count {
+        info!(
+            "Log pruned: {} actions -> {} actions, {} fids -> {} fids",
+            original_action_count,
+            log.actions.len(),
+            original_fid_count,
+            log.fid_map.len()
+        );
+    }
 }
 
 fn send_statediff(mut stream: UnixStream) -> Result<(), Box<dyn std::error::Error>> {

@@ -3,6 +3,7 @@ use fuselog_core::socket::start_listener;
 use fuselog_core::FuseLogFS;
 use std::path::PathBuf;
 use std::env;
+use std::sync::mpsc;
 use std::thread;
 use std::fs::File;
 use daemonize::Daemonize;
@@ -39,7 +40,8 @@ fn main() {
     if foreground {
         env_logger::init();
         log::info!("Starting Fuselog in foreground mode on directory: '{}'", root_dir.display());
-        run_fuse_logic(root_dir);
+        let exit_code = run_fuse_logic(root_dir);
+        std::process::exit(exit_code);
     } else {
         // Check if daemon logs are enabled (default: false)
         let enable_daemon_logs = env::var("FUSELOG_DAEMON_LOGS")
@@ -96,7 +98,8 @@ fn main() {
             Ok(_) => {
                 env_logger::init();
                 log::info!("Successfully daemonized fuselog for directory: '{}'", root_dir.display());
-                run_fuse_logic(root_dir);
+                let exit_code = run_fuse_logic(root_dir);
+                std::process::exit(exit_code);
             }
             Err(e) => {
                 eprintln!("Error daemonizing: {}", e);
@@ -106,15 +109,16 @@ fn main() {
     }
 }
 
-fn run_fuse_logic(root_dir: PathBuf) {
+fn run_fuse_logic(root_dir: PathBuf) -> i32 {
     log::info!("Starting Fuselog on directory: '{}'", root_dir.display());
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
     let socket_file = env::var("FUSELOG_SOCKET_FILE").unwrap_or_else(|_| SOCKET_PATH.to_string());
 
     let listener_handle = thread::spawn({
         let socket_file = socket_file.clone();
         move || {
-            if let Err(e) = start_listener(&socket_file[..]) {
+            if let Err(e) = start_listener(&socket_file[..], shutdown_rx) {
                 log::error!("Failed to start socket listener: {}", e);
                 std::process::exit(1);
             }
@@ -135,12 +139,22 @@ fn run_fuse_logic(root_dir: PathBuf) {
 
     let fs = FuseLogFS::new(root_dir.clone());
 
-    if let Err(e) = fuser::mount2(fs, &root_dir, &options) {
-        log::error!("Failed to mount FUSE filesystem: {}", e);
-        std::process::exit(1);
-    }
+    let exit_code = match fuser::mount2(fs, &root_dir, &options) {
+        Ok(_) => {
+            log::info!("FUSE filesystem has been unmounted.");
+            0
+        }
+        Err(e) => {
+            log::error!("Failed to mount FUSE filesystem: {}", e);
+            1
+        }
+    };
+
+    let _ = shutdown_tx.send(());
 
     if let Err(e) = listener_handle.join() {
         log::error!("Listener thread panicked: {:?}", e);
     }
+
+    exit_code
 }
